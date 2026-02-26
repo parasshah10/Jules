@@ -218,7 +218,7 @@ async def _run_grok(task_id: str, prompt: str):
     try:
         _tasks[task_id]["status"] = "running"
         stream = await grok_client.chat.completions.create(
-            model="grok-4-fast",
+            model="grok-4.1-fast",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
             stream=True,
