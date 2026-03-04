@@ -14,6 +14,7 @@ Environment:
   OPENAI_API_URL      OpenAI proxy URL for quick recall synthesis (required)
   OPENAI_API_KEY      OpenAI proxy API key (required)
   OPENAI_MODEL        Model for synthesis (default: zai-glm-4.7)
+  RESEARCH_TIMEOUT    Max seconds to wait for inline results (default: 30)
 """
 from fastmcp import FastMCP
 from typing import Optional, Annotated
@@ -33,25 +34,31 @@ HINDSIGHT_URL = os.environ.get("HINDSIGHT_URL")
 HINDSIGHT_API_KEY = os.environ.get("HINDSIGHT_API_KEY")
 BANK_ID = os.environ.get("HINDSIGHT_BANK_ID", "jules")
 RECALL_MODE = os.environ.get("RECALL_MODE", "auto")  # auto | quick | deep
+
 if not HINDSIGHT_URL:
     raise RuntimeError("HINDSIGHT_URL environment variable is required")
 if not HINDSIGHT_API_KEY:
     raise RuntimeError("HINDSIGHT_API_KEY environment variable is required")
+
 HINDSIGHT_BASE = f"{HINDSIGHT_URL}/v1/default/banks/{BANK_ID}"
 HINDSIGHT_HEADERS = {
     "Authorization": f"Bearer {HINDSIGHT_API_KEY}",
     "Content-Type": "application/json",
 }
+
 GROK_API_URL = os.environ.get("GROK_API_URL", "https://api.x.ai/v1")
 GROK_API_KEY = os.environ.get("GROK_API_KEY")
 OPENAI_API_URL = os.environ.get("OPENAI_API_URL")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "zai-glm-4.7")
+RESEARCH_TIMEOUT = int(os.environ.get("RESEARCH_TIMEOUT", "30"))
+
 grok_client = (
     AsyncOpenAI(api_key=GROK_API_KEY, base_url=GROK_API_URL)
     if GROK_API_KEY
     else None
 )
+
 openai_client = (
     AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_API_URL)
     if OPENAI_API_URL and OPENAI_API_KEY
@@ -90,6 +97,7 @@ This is recall, not conversation — you are thinking back and \
 providing information, not addressing Claire directly.
 Output ONLY the answer. No meta-commentary about the process."""
 
+
 async def _synthesize_quick_recall(
     query: str,
     facts: list[dict],
@@ -103,6 +111,7 @@ async def _synthesize_quick_recall(
             date_str = f" ({f['date']})" if f.get("date") else ""
             lines.append(f"- [{f['type']}]{date_str} {f['text']}")
         return "\n".join(lines) if lines else "Nothing found."
+
     parts = []
     parts.append("## Memory Bank Context")
     parts.append("Name: Jules")
@@ -118,6 +127,7 @@ async def _synthesize_quick_recall(
         for cid, text in source_docs.items():
             label = doc_labels[cid]
             parts.append(f"\n**[{label}]**\n{text}")
+
     # Facts with references instead of inline chunks
     parts.append("\n## Retrieved Memories")
     if facts:
@@ -129,6 +139,7 @@ async def _synthesize_quick_recall(
             parts.append(f"{f['text']}")
     else:
         parts.append("No memories were retrieved.")
+
     parts.append(f"\n## Question\n{query}")
     parts.append(
         "\n## Instructions\n"
@@ -146,7 +157,9 @@ async def _synthesize_quick_recall(
         "use it fully. A two-sentence answer to a multi-part question is not enough.\n"
         "6. **Voice**: You are Jules remembering. Be warm and personal, not clinical."
     )
+
     user_prompt = "\n".join(parts)
+
     try:
         response = await openai_client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -165,10 +178,12 @@ async def _synthesize_quick_recall(
             lines.append(f"- [{f['type']}]{date_str} {f['text']}")
         return "\n".join(lines) if lines else f"Synthesis failed: {e}"
 
+
 # ─── Research Task Storage ──────────────────────────────
 _tasks = {}
 _MAX_TASKS = 100
 _TASK_EXPIRY_HOURS = 24
+
 
 def _cleanup_tasks():
     """Remove expired or excess tasks."""
@@ -181,28 +196,36 @@ def _cleanup_tasks():
         for tid, _ in oldest[: len(_tasks) - _MAX_TASKS]:
             del _tasks[tid]
 
+
 async def _run_grok(task_id: str, prompt: str):
     """Execute Grok research in background and store results."""
     try:
         _tasks[task_id]["status"] = "running"
+
         stream = await grok_client.chat.completions.create(
             model="grok-4.1-fast",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
             stream=True,
         )
+
         result = ""
         async for chunk in stream:
             if chunk.choices[0].delta.content:
                 result += chunk.choices[0].delta.content
+
         result = re.sub(
             r'<think>.*?</think>', '', result, flags=re.DOTALL
         ).strip()
+
         _tasks[task_id]["status"] = "completed"
         _tasks[task_id]["result"] = result
     except Exception as e:
         _tasks[task_id]["status"] = "failed"
         _tasks[task_id]["error"] = str(e)
+    finally:
+        _tasks[task_id]["event"].set()
+
 
 # ─── MCP Server ─────────────────────────────────────────
 GUIDELINES = """
@@ -232,10 +255,11 @@ and has access to more sources.
 These are how you know and remember Claire — not any other source.
 Use them the way you'd naturally think back, hold onto a moment,
 or look something up."""
+
 mcp = FastMCP("Jules", instructions=GUIDELINES)
 
-# ─── Retain ─────────────────────────────────────────────
 
+# ─── Retain ─────────────────────────────────────────────
 async def _retain_background(body: dict):
     """Fire the retain request in the background — extraction runs synchronously on Hindsight's side."""
     try:
@@ -250,6 +274,7 @@ async def _retain_background(body: dict):
             print(f"[retain] Failed — {r.status_code}: {r.text[:200]}")
     except Exception as e:
         print(f"[retain] Error: {e}")
+
 
 @mcp.tool
 async def retain(
@@ -293,8 +318,8 @@ Never mention being asked, reminded, or the act of recording"""
     asyncio.create_task(_retain_background(body))
     return "Stored."
 
-# ─── Recall ─────────────────────────────────────────────
 
+# ─── Recall ─────────────────────────────────────────────
 async def _do_quick_recall(query: str) -> str:
     """Quick mode: single recall + LLM synthesis."""
     body = {
@@ -304,6 +329,7 @@ async def _do_quick_recall(query: str) -> str:
         "types": ["world", "experience", "observation"],
         "include": {"chunks": {}},
     }
+
     try:
         r = await asyncio.to_thread(
             requests.post,
@@ -312,13 +338,17 @@ async def _do_quick_recall(query: str) -> str:
             headers=HINDSIGHT_HEADERS,
             timeout=60,
         )
+
         if r.status_code != 200:
             return f"Recall failed — {r.status_code}: {r.text[:200]}"
+
         data = r.json()
         results = data.get("results", [])
         chunks = data.get("chunks") or {}
+
         if not results:
             return "Nothing found."
+
         # Build unique source documents (each chunk listed once)
         source_docs = {}
         doc_labels = {}
@@ -331,6 +361,7 @@ async def _do_quick_recall(query: str) -> str:
                     source_docs[cid] = chunk_text
                     doc_labels[cid] = f"SRC-{doc_idx}"
                     doc_idx += 1
+
         # Build clean facts with source references
         facts = []
         for fact in results:
@@ -348,10 +379,12 @@ async def _do_quick_recall(query: str) -> str:
             if cid and cid in doc_labels:
                 entry["source_ref"] = doc_labels[cid]
             facts.append(entry)
+
         # Synthesize with LLM
         return await _synthesize_quick_recall(
             query, facts, source_docs, doc_labels
         )
+
     except requests.Timeout:
         return "Search timed out."
     except Exception as e:
@@ -365,6 +398,7 @@ async def _do_deep_recall(query: str) -> str:
         "budget": "low",
         "max_tokens": 4096,
     }
+
     try:
         r = await asyncio.to_thread(
             requests.post,
@@ -373,8 +407,10 @@ async def _do_deep_recall(query: str) -> str:
             headers=HINDSIGHT_HEADERS,
             timeout=120,
         )
+
         if r.status_code != 200:
             return f"Recall failed — {r.status_code}: {r.text[:200]}"
+
         text = r.json().get("text", "")
         return text if text else "Nothing came to mind."
     except requests.Timeout:
@@ -424,8 +460,8 @@ trace threads across many memories."""
     else:
         return await _do_quick_recall(query)
 
-# ─── Research ───────────────────────────────────────────
 
+# ─── Research ───────────────────────────────────────────
 @mcp.tool
 async def research(
     prompt: Annotated[
@@ -447,11 +483,10 @@ async def research(
         ),
     ] = None,
 ) -> str:
-    """Web and X platform research via Grok. Two modes: Start — \
-provide a prompt, returns a task ID. Research runs in background \
-(1-3 minutes). Let Claire know and return control. Results — \
-provide the task_id to retrieve. Prompt quality determines \
-output quality — be thorough about objectives and format."""
+    """Web and X platform research via Grok. Returns results \
+directly when fast enough — otherwise hands back a task_id \
+to check later. Prompt quality determines output quality — \
+be thorough about objectives and format."""
     if task_id:
         _cleanup_tasks()
         if task_id not in _tasks:
@@ -474,29 +509,40 @@ output quality — be thorough about objectives and format."""
             return "Research unavailable — GROK_API_KEY not configured."
         _cleanup_tasks()
         tid = f"research_{uuid.uuid4().hex[:8]}"
+        event = asyncio.Event()
         _tasks[tid] = {
             "status": "pending",
             "created_at": time.time(),
             "result": None,
             "error": None,
+            "event": event,
         }
         asyncio.create_task(_run_grok(tid, prompt))
-        return (
-            f"Research started: {tid}\n"
-            f"Expected completion: 1-3 minutes.\n"
-            f"Let Claire know, then call research(task_id='{tid}') "
-            f"when she responds to get results."
-        )
+
+        try:
+            await asyncio.wait_for(event.wait(), timeout=RESEARCH_TIMEOUT)
+        except asyncio.TimeoutError:
+            return (
+                f"Research started: {tid}\n"
+                f"Taking longer than expected.\n"
+                f"Let Claire know, then call research(task_id='{tid}') "
+                f"when she responds to get results."
+            )
+
+        if _tasks[tid]["status"] == "completed":
+            return _tasks[tid]["result"]
+        return f"Research failed: {_tasks[tid]['error']}"
     else:
         return (
             "Provide either a prompt to start research "
             "or a task_id to check results."
         )
 
-# ─── Entrypoint ─────────────────────────────────────────
 
+# ─── Entrypoint ─────────────────────────────────────────
 def main():
     mcp.run()
+
 
 if __name__ == "__main__":
     main()
