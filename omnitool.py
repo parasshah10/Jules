@@ -279,7 +279,7 @@ class OmniTool:
         This is the most token-sensitive piece — kept tight on purpose.
         """
         lines = [
-            'This is the ONLY interface available. All capabilities are accessed here as actions.',
+            'Additional capabilities beyond the primary tools. Access them as actions here.',
             '',
             'action="tool_name"  params={...arguments...}',
             'action="search"     params={"q": "natural language description of what you want"}',
@@ -512,7 +512,7 @@ class OmniTool:
         omni = self  # explicit capture for the closure
 
         @self.mcp.tool(description=description)
-        async def tools(action: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        async def toolbox(action: str, params: Optional[Dict[str, Any]] = None) -> Any:
             resolved = params if params is not None else {}
             tool_name, parsed_params = omni._parse_call(action, resolved)
 
