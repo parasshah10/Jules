@@ -379,7 +379,7 @@ async def startup(server: FastMCP):
         tool_defs=remote_defs,
         refresh_callback=refresh_fn,
         n_primary=0,
-        show_index="research, get_youtube_transcript, and more (use find_tool to find them)",
+        show_index="research, Youtube-get_youtube_video_transcript, and more (use find_tool to find them)",
     )
 
     yield {}
