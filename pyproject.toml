@@ -9,5 +9,8 @@ dependencies = [
     "rank-bm25"
 ]
 
+[tool.setuptools]
+py-modules = ["server", "omnitool"]
+
 [project.scripts]
 jules = "server:main"
