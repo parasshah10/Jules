@@ -87,6 +87,9 @@ REMOTE_SERVERS = [
         # "tools": ["get_youtube_video_transcript"],
     },
     {
+        "url": os.environ.get("FOLIO_MCP_URL"),
+    },
+    {
         "url": os.environ.get("TOOLS_MCP_URL"),
     },
 ]
