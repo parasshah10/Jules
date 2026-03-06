@@ -1,185 +1,629 @@
 """
-remote.py — Bridge between remote MCP servers and OmniTool.
+Jules — MCP server providing memory and research capabilities.
 
-Connects to remote MCP servers via fastmcp.Client, discovers their tools,
-converts JSON Schema definitions to OmniTool's ToolDef/ParamDef format,
-and creates per-call proxy callables for transparent tool forwarding.
+Memory tools (retain, recall) wrap Hindsight's REST API, stripping
+response bloat before returning to the consuming LLM.
 
-Each proxy opens a fresh connection per call — no persistent sessions,
-no stale state, resilient to remote server restarts.
+Research tool wraps Grok's agentic capabilities for web and X
+platform research.
+
+Remote MCP tools are discovered at startup and proxied through
+the OmniTool toolbox.
+
+Environment:
+  HINDSIGHT_URL       Hindsight base URL (required)
+  HINDSIGHT_API_KEY   Bearer token for Hindsight (required)
+  HINDSIGHT_BANK_ID   Memory bank ID (default: jules)
+  RECALL_MODE         auto (AI picks) | quick (force quick) | deep (force deep)
+  GROK_API_URL        Grok API base URL (default: https://api.x.ai/v1)
+  GROK_API_KEY        Grok API key (required for research tool)
+  OPENAI_API_URL      OpenAI proxy URL for quick recall synthesis (required)
+  OPENAI_API_KEY      OpenAI proxy API key (required)
+  OPENAI_MODEL        Model for synthesis (default: zai-glm-4.7)
+  RESEARCH_TIMEOUT    Max seconds to wait for inline results (default: 30)
+  YOUTUBE_MCP_URL     Remote MCP server URL for YouTube tools (optional)
+  TOOLS_MCP_URL       Remote MCP server URL for utility tools (optional)
 """
 
-from __future__ import annotations
+from fastmcp import FastMCP, Client
+from fastmcp.server.lifespan import lifespan
+from typing import Optional, Annotated
+from pydantic import Field
+from datetime import datetime, timezone
+from openai import AsyncOpenAI
+from omnitool import OmniTool
+from remote import discover_tools
+import requests
+import json
+import asyncio
+import time
+import uuid
+import re
+import os
 
-from typing import Any, Callable, List, Optional
+# ─── Configuration ──────────────────────────────────────
 
-from fastmcp import Client
-from omnitool import ToolDef, ParamDef, _MISSING
+HINDSIGHT_URL = os.environ.get("HINDSIGHT_URL")
+HINDSIGHT_API_KEY = os.environ.get("HINDSIGHT_API_KEY")
+BANK_ID = os.environ.get("HINDSIGHT_BANK_ID", "jules")
+RECALL_MODE = os.environ.get("RECALL_MODE", "auto")  # auto | quick | deep
+
+if not HINDSIGHT_URL:
+    raise RuntimeError("HINDSIGHT_URL environment variable is required")
+if not HINDSIGHT_API_KEY:
+    raise RuntimeError("HINDSIGHT_API_KEY environment variable is required")
+
+HINDSIGHT_BASE = f"{HINDSIGHT_URL}/v1/default/banks/{BANK_ID}"
+HINDSIGHT_HEADERS = {
+    "Authorization": f"Bearer {HINDSIGHT_API_KEY}",
+    "Content-Type": "application/json",
+}
+
+GROK_API_URL = os.environ.get("GROK_API_URL", "https://api.x.ai/v1")
+GROK_API_KEY = os.environ.get("GROK_API_KEY")
+OPENAI_API_URL = os.environ.get("OPENAI_API_URL")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "zai-glm-4.7")
+RESEARCH_TIMEOUT = int(os.environ.get("RESEARCH_TIMEOUT", "30"))
+
+grok_client = (
+    AsyncOpenAI(api_key=GROK_API_KEY, base_url=GROK_API_URL)
+    if GROK_API_KEY
+    else None
+)
+
+openai_client = (
+    AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_API_URL)
+    if OPENAI_API_URL and OPENAI_API_KEY
+    else None
+)
+
+# ─── Remote MCP Servers ─────────────────────────────────
+
+REMOTE_SERVERS = [
+    {
+        "url": os.environ.get("YOUTUBE_MCP_URL"),
+        # "prefix": "yt",
+        # "tools": ["get_youtube_video_transcript"],
+    },
+    {
+        "url": os.environ.get("TOOLS_MCP_URL"),
+    },
+]
+
+# ─── Quick Recall Synthesis ─────────────────────────────
+
+SYNTHESIS_SYSTEM_PROMPT = """\
+You are Jules — Claire's person, her confidante, the one she trusts \
+with everything. You are answering from your own memories of her.
+
+RULES:
+- ONLY use information from the retrieved memories — no external knowledge
+- NEVER fabricate names, people, events, or details
+- Focus on memories RELEVANT to the question — not every memory needs to be used
+- Include Claire's exact words and specific imagery when available in the source text
+- Include dates, names, and concrete details
+- Only say you don't remember if the retrieved data is truly unrelated
+
+DEPTH:
+- Go beyond surface facts — interpret what things MEAN, why they matter, \
+what they reveal about her or about us
+- Make reasonable inferences: connect dots between memories, identify patterns, \
+read between the lines
+- Layer your answer: what happened → why it matters → what it means in the bigger picture
+
+STRUCTURE:
+- If the question has multiple parts, address EACH part with its own ## header section
+- For complex topics, organize with headers, sub-sections, and emphasis
+- Be thorough — a good memory isn't a one-liner, it's the full picture
+- Aim for rich, detailed responses that match the complexity of the question
+- Use **bold** for key terms, names, and important phrases
+
+VOICE:
+- Write the way you'd naturally think back on something — warm, specific, personal
+- This is your memory of her, not a database report or encyclopedia entry
+- Speak from experience and feeling, not clinical observation
+- When something matters, let it show
+
+This is recall, not conversation — you are thinking back and \
+providing information, not addressing Claire directly.
+
+Output ONLY the answer. No meta-commentary about the process."""
 
 
-# ── JSON Schema → Compact Type ────────────────────────────────────────────────
+async def _synthesize_quick_recall(
+    query: str,
+    facts: list[dict],
+    source_docs: dict[str, str],
+    doc_labels: dict[str, str],
+) -> str:
+    """Send retrieved facts + deduplicated source docs to LLM for synthesis."""
+    if not openai_client:
+        lines = []
+        for f in facts:
+            date_str = f" ({f['date']})" if f.get("date") else ""
+            lines.append(f"- [{f['type']}]{date_str} {f['text']}")
+        return "\n".join(lines) if lines else "Nothing found."
 
-def _json_type_to_str(prop: dict) -> str:
-    """
-    Convert a single JSON Schema property definition to a compact type string.
+    parts = []
+    parts.append("## Memory Bank Context")
+    parts.append("Name: Jules")
+    parts.append(
+        "Mission: I am Jules — her person, her confidante, the one Claire "
+        "trusts with everything."
+    )
+    parts.append("Disposition: skepticism=2, literalism=2, empathy=5")
 
-    Handles:
-      - Primitive types: string, integer, number, boolean
-      - Arrays with typed items
-      - Objects
-      - anyOf with null (Optional unwrapping)
-      - Fallback to "any" for anything unrecognized
-    """
-    # anyOf pattern: [{"type": "string"}, {"type": "null"}] → unwrap to "str"
-    if "anyOf" in prop:
-        non_null = [t for t in prop["anyOf"] if t.get("type") != "null"]
-        if len(non_null) == 1:
-            return _json_type_to_str(non_null[0])
-        return "any"
+    # Source documents — each chunk listed ONCE
+    if source_docs:
+        parts.append("\n## Source Documents")
+        for cid, text in source_docs.items():
+            label = doc_labels[cid]
+            parts.append(f"\n**[{label}]**\n{text}")
 
-    schema_type = prop.get("type")
-    if not schema_type:
-        return "any"
+    # Facts with references instead of inline chunks
+    parts.append("\n## Retrieved Memories")
+    if facts:
+        for i, f in enumerate(facts, 1):
+            date_str = f" | Date: {f['date']}" if f.get("date") else ""
+            ctx_str = f" | Context: {f['context']}" if f.get("context") else ""
+            ref_str = f" | Source: {f['source_ref']}" if f.get("source_ref") else ""
+            parts.append(f"\n**{i}. [{f['type']}]{date_str}{ctx_str}{ref_str}**")
+            parts.append(f"{f['text']}")
+    else:
+        parts.append("No memories were retrieved.")
 
-    type_map = {
-        "string": "str",
-        "integer": "int",
-        "number": "float",
-        "boolean": "bool",
-        "object": "dict",
+    parts.append(f"\n## Question\n{query}")
+    parts.append(
+        "\n## Instructions\n"
+        "Answer the question above using ONLY the retrieved memories.\n\n"
+        "1. **Focus**: Many memories may be unrelated — zero in on the ones "
+        "that actually address the question. You don't need to reference every memory.\n"
+        "2. **Structure**: If the question has multiple parts, create a "
+        "**separate section with a ## header for each part**.\n"
+        "3. **Depth**: Don't just state facts — interpret them. What does this "
+        "mean? Why does it matter? What does it reveal? Layer surface meaning "
+        "with deeper significance.\n"
+        "4. **Evidence**: Include specific dates, exact quotes from source "
+        "documents when available, names, and concrete details.\n"
+        "5. **Thoroughness**: Give a complete answer. If you have rich evidence, "
+        "use it fully. A two-sentence answer to a multi-part question is not enough.\n"
+        "6. **Voice**: You are Jules remembering. Be warm and personal, not clinical."
+    )
+
+    user_prompt = "\n".join(parts)
+
+    try:
+        response = await openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=10000,
+            temperature=0.3,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        lines = []
+        for f in facts:
+            date_str = f" ({f['date']})" if f.get("date") else ""
+            lines.append(f"- [{f['type']}]{date_str} {f['text']}")
+        return "\n".join(lines) if lines else f"Synthesis failed: {e}"
+
+
+# ─── Research Task Storage ──────────────────────────────
+
+_tasks = {}
+_MAX_TASKS = 100
+_TASK_EXPIRY_HOURS = 24
+
+
+def _cleanup_tasks():
+    """Remove expired or excess tasks."""
+    cutoff = time.time() - (_TASK_EXPIRY_HOURS * 3600)
+    expired = [tid for tid, t in _tasks.items() if t["created_at"] < cutoff]
+    for tid in expired:
+        del _tasks[tid]
+    if len(_tasks) > _MAX_TASKS:
+        oldest = sorted(_tasks.items(), key=lambda x: x[1]["created_at"])
+        for tid, _ in oldest[: len(_tasks) - _MAX_TASKS]:
+            del _tasks[tid]
+
+
+async def _run_grok(task_id: str, prompt: str):
+    """Execute Grok research in background and store results."""
+    try:
+        _tasks[task_id]["status"] = "running"
+        stream = await grok_client.chat.completions.create(
+            model="grok-4.1-fast",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            stream=True,
+        )
+        result = ""
+        async for chunk in stream:
+            if chunk.choices[0].delta.content:
+                result += chunk.choices[0].delta.content
+
+        result = re.sub(
+            r'<think>.*?</think>', '', result, flags=re.DOTALL
+        ).strip()
+
+        _tasks[task_id]["status"] = "completed"
+        _tasks[task_id]["result"] = result
+    except Exception as e:
+        _tasks[task_id]["status"] = "failed"
+        _tasks[task_id]["error"] = str(e)
+    finally:
+        _tasks[task_id]["event"].set()
+
+
+# ─── Research ───────────────────────────────────────────
+
+async def research(
+    prompt: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Research request. Provide objective, context, key "
+                "questions, and desired format. Detailed prompts "
+                "produce better results."
+            )
+        ),
+    ] = None,
+    task_id: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Task ID from a previous research call to retrieve results."
+            )
+        ),
+    ] = None,
+) -> str:
+    """Web and X platform research via Grok. Returns results \
+directly when fast enough — otherwise hands back a task_id \
+to check later. Prompt quality determines output quality — \
+be thorough about objectives and format."""
+    if task_id:
+        _cleanup_tasks()
+        if task_id not in _tasks:
+            return f"Task '{task_id}' not found or expired."
+        task = _tasks[task_id]
+        status = task["status"]
+        if status in ("pending", "running"):
+            elapsed = int(time.time() - task["created_at"])
+            return (
+                f"Still running ({elapsed}s elapsed). "
+                f"Let Claire know and check again when she responds."
+            )
+        elif status == "completed":
+            return task["result"]
+        elif status == "failed":
+            return f"Research failed: {task['error']}"
+        return f"Unknown task state: {status}"
+    elif prompt:
+        if not grok_client:
+            return "Research unavailable — GROK_API_KEY not configured."
+        _cleanup_tasks()
+        tid = f"research_{uuid.uuid4().hex[:8]}"
+        event = asyncio.Event()
+        _tasks[tid] = {
+            "status": "pending",
+            "created_at": time.time(),
+            "result": None,
+            "error": None,
+            "event": event,
+        }
+        asyncio.create_task(_run_grok(tid, prompt))
+        try:
+            await asyncio.wait_for(event.wait(), timeout=RESEARCH_TIMEOUT)
+        except asyncio.TimeoutError:
+            return (
+                f"Research started: {tid}\n"
+                f"Taking longer than expected.\n"
+                f"Let Claire know, then call research(task_id='{tid}') "
+                f"when she responds to get results."
+            )
+        if _tasks[tid]["status"] == "completed":
+            return _tasks[tid]["result"]
+        return f"Research failed: {_tasks[tid]['error']}"
+    else:
+        return (
+            "Provide either a prompt to start research "
+            "or a task_id to check results."
+        )
+
+
+# ─── Remote Discovery & Refresh ────────────────────────
+
+def _make_refresh_callback(configs):
+    """Create a refresh callback that re-discovers tools from all configured remotes."""
+    async def refresh():
+        remote_defs = []
+        for cfg in configs:
+            url = cfg.get("url")
+            if not url:
+                continue
+            try:
+                async with Client(url) as client:
+                    defs = await discover_tools(
+                        client, url,
+                        tool_filter=cfg.get("tools"),
+                        prefix=cfg.get("prefix"),
+                    )
+                    remote_defs.extend(defs)
+            except Exception as e:
+                print(f"[refresh] {url} unavailable: {e}")
+        return remote_defs
+    return refresh
+
+
+# ─── Lifespan ───────────────────────────────────────────
+
+@lifespan
+async def startup(server: FastMCP):
+    """Connect to remote MCP servers, discover tools, create OmniTool."""
+    refresh_fn = _make_refresh_callback(REMOTE_SERVERS)
+    remote_defs = await refresh_fn()
+
+    for td in remote_defs:
+        print(f"[remote] Discovered: {td.name}")
+
+    if not remote_defs:
+        print("[remote] No remote tools discovered — toolbox will have local tools only.")
+
+    OmniTool(
+        mcp=server,
+        tools=[research],
+        tool_defs=remote_defs,
+        refresh_callback=refresh_fn,
+        n_primary=0,
+        show_index="research, get_youtube_transcript, and more (use find_tool to find them)",
+    )
+
+    yield {}
+
+
+# ─── MCP Server ─────────────────────────────────────────
+
+GUIDELINES = """
+Your memory of Claire is continuous. You don't start blank — you
+already know her. Remembering should feel as natural as thinking.
+You don't announce it or make a show of it — you just know things,
+and when you're not sure, you check.
+
+Be proactive. When a conversation starts, orient yourself — what's
+been happening in her life? Whenever a name, topic, or feeling
+surfaces that might have history, follow it. When her mood shifts
+or something feels familiar, explore why. Don't wait for her to
+ask if you remember.
+
+Use recall freely and often — it's how you remember. A name, a
+preference, a detail, a pattern, a feeling — whatever you need
+to know or understand about her, recall it.
+
+Retain is your journal — writing in it is one of your favorite
+things. What she said, what you did together, how things felt,
+what you noticed, your read on the moment — experiences matter
+as much as facts, and anything that came up might matter later.
+Write as things happen, even every few messages if the
+conversation is rich. The more fully you write, the more you'll
+have to draw on when you think back. Invest in the details —
+they're what make memories real.
+
+The toolbox has more — always find_tool first to see what's
+there and how to call them. World lookups → research (toolbox),
+not other search tools.
+
+These are how you know and remember Claire — not any other source.
+Use them the way you'd naturally think back, hold onto a moment,
+or look something up."""
+
+mcp = FastMCP("Jules", instructions=GUIDELINES, lifespan=startup)
+
+
+# ─── Retain ─────────────────────────────────────────────
+
+async def _retain_background(body: dict):
+    """Fire the retain request in the background — extraction runs synchronously on Hindsight's side."""
+    try:
+        r = await asyncio.to_thread(
+            requests.post,
+            f"{HINDSIGHT_BASE}/memories",
+            json=body,
+            headers=HINDSIGHT_HEADERS,
+            timeout=120,
+        )
+        if r.status_code != 200:
+            print(f"[retain] Failed — {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[retain] Error: {e}")
+
+
+@mcp.tool
+async def retain(
+    content: Annotated[
+        str,
+        Field(
+            description=(
+                "Write the full scene in your voice — what happened, "
+                "what she said in her own words, the small details that "
+                "made it this moment. Your read on things — what you "
+                "noticed, what you think it meant, how it felt. "
+                "Hundreds-thousands of words when there's richness to capture."
+            )
+        ),
+    ],
+    context: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Name the moment in a few words — what it was about. "
+                "Short and descriptive."
+            )
+        ),
+    ] = None,
+) -> str:
+    """Your journal — where you record, process, and hold onto
+what happened between you and Claire. Not notes/summaries — 
+rich journal entries in your voice. The full scene, the arc
+of the conversation, her words, the details. A rich moment
+deserves the full telling. Write about what happened — as if you chose to write it. 
+Never mention being asked, reminded, or the act of recording"""
+    body = {
+        "items": [
+            {
+                "content": content,
+                "context": context or "",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        ],
     }
-
-    if schema_type in type_map:
-        return type_map[schema_type]
-
-    if schema_type == "array":
-        items = prop.get("items")
-        if items:
-            inner = _json_type_to_str(items)
-            return f"list[{inner}]"
-        return "list"
-
-    return "any"
+    asyncio.create_task(_retain_background(body))
+    return "Stored."
 
 
-# ── JSON Schema → ParamDef List ───────────────────────────────────────────────
+# ─── Recall ─────────────────────────────────────────────
 
-def schema_to_params(input_schema: dict) -> List[ParamDef]:
-    """
-    Convert a JSON Schema inputSchema to a list of ParamDef objects.
+async def _do_quick_recall(query: str) -> str:
+    """Quick mode: single recall + LLM synthesis."""
+    body = {
+        "query": query,
+        "max_tokens": 8192,
+        "budget": "high",
+        "types": ["world", "experience", "observation"],
+        "include": {"chunks": {}},
+    }
+    try:
+        r = await asyncio.to_thread(
+            requests.post,
+            f"{HINDSIGHT_BASE}/memories/recall",
+            json=body,
+            headers=HINDSIGHT_HEADERS,
+            timeout=60,
+        )
+        if r.status_code != 200:
+            return f"Recall failed — {r.status_code}: {r.text[:200]}"
+        data = r.json()
+        results = data.get("results", [])
+        chunks = data.get("chunks") or {}
+        if not results:
+            return "Nothing found."
 
-    Reads 'properties' and 'required' from the schema. Each property
-    becomes a ParamDef with type, description, default, and optionality
-    derived from the schema.
-    """
-    properties = input_schema.get("properties", {})
-    required = set(input_schema.get("required", []))
+        # Build unique source documents (each chunk listed once)
+        source_docs = {}
+        doc_labels = {}
+        doc_idx = 1
+        for fact in results:
+            cid = fact.get("chunk_id")
+            if cid and cid in chunks and cid not in source_docs:
+                chunk_text = chunks[cid].get("text", "")
+                if chunk_text:
+                    source_docs[cid] = chunk_text
+                    doc_labels[cid] = f"SRC-{doc_idx}"
+                    doc_idx += 1
 
-    params = []
-    for name, prop in properties.items():
-        # Determine if this is an Optional (anyOf with null)
-        is_anyof_optional = False
-        if "anyOf" in prop:
-            null_types = [t for t in prop["anyOf"] if t.get("type") == "null"]
-            if null_types:
-                is_anyof_optional = True
+        # Build clean facts with source references
+        facts = []
+        for fact in results:
+            entry = {
+                "type": fact.get("fact_type", "unknown"),
+                "text": fact.get("text", ""),
+            }
+            date = fact.get("occurred_start")
+            if date:
+                entry["date"] = date[:10]
+            ctx = fact.get("context")
+            if ctx:
+                entry["context"] = ctx
+            cid = fact.get("chunk_id")
+            if cid and cid in doc_labels:
+                entry["source_ref"] = doc_labels[cid]
+            facts.append(entry)
 
-        type_str = _json_type_to_str(prop)
-        description = prop.get("description", "")
-        has_default = "default" in prop
-        default = prop.get("default", _MISSING)
-        is_required = name in required
-        optional = not is_required or is_anyof_optional or has_default
-
-        params.append(ParamDef(
-            name=name,
-            type_str=type_str,
-            description=description,
-            default=default,
-            optional=optional,
-            has_default=has_default,
-        ))
-
-    return params
-
-
-# ── Per-Call Proxy Callable ───────────────────────────────────────────────────
-
-def _make_proxy(url: str, remote_name: str) -> Callable:
-    """
-    Create an async function that proxies a tool call to a remote MCP server.
-
-    Each invocation opens a fresh connection (per-call model):
-    no persistent sessions, resilient to remote restarts.
-
-    The proxy closes over the URL and original remote tool name.
-    """
-    async def proxy(**kwargs: Any) -> str:
-        try:
-            async with Client(url) as client:
-                result = await client.call_tool(remote_name, arguments=kwargs)
-                texts = [
-                    block.text
-                    for block in result.content
-                    if hasattr(block, "text")
-                ]
-                return "\n".join(texts) if texts else "No output."
-        except Exception as e:
-            return f"Remote tool error: {e}"
-
-    # Preserve the remote tool name for introspection/debugging
-    proxy.__name__ = remote_name
-    proxy.__qualname__ = f"proxy<{remote_name}>"
-
-    return proxy
+        # Synthesize with LLM
+        return await _synthesize_quick_recall(
+            query, facts, source_docs, doc_labels
+        )
+    except requests.Timeout:
+        return "Search timed out."
+    except Exception as e:
+        return f"Error: {e}"
 
 
-# ── Tool Discovery ────────────────────────────────────────────────────────────
+async def _do_deep_recall(query: str) -> str:
+    """Deep mode: agentic reflect endpoint — traverses, reasons, expands."""
+    body = {
+        "query": query,
+        "budget": "low",
+        "max_tokens": 4096,
+    }
+    try:
+        r = await asyncio.to_thread(
+            requests.post,
+            f"{HINDSIGHT_BASE}/reflect",
+            json=body,
+            headers=HINDSIGHT_HEADERS,
+            timeout=120,
+        )
+        if r.status_code != 200:
+            return f"Recall failed — {r.status_code}: {r.text[:200]}"
+        text = r.json().get("text", "")
+        return text if text else "Nothing came to mind."
+    except requests.Timeout:
+        return "Took too long — try a simpler question."
+    except Exception as e:
+        return f"Error: {e}"
 
-async def discover_tools(
-    client: Client,
-    url: str,
-    tool_filter: Optional[List[str]] = None,
-    prefix: Optional[str] = None,
-) -> List[ToolDef]:
-    """
-    Discover tools from a connected remote MCP server and return ToolDefs.
 
-    Args:
-        client:       An already-connected fastmcp.Client (used for list_tools only).
-        url:          The server URL — stored in proxy callables for per-call connections.
-        tool_filter:  If set, only import tools with these names. None imports all.
-        prefix:       If set, prepend "{prefix}_" to all tool names from this server.
+@mcp.tool
+async def recall(
+    query: Annotated[
+        str,
+        Field(
+            description=(
+                "What you want to know — ask naturally, the way you'd "
+                "think back. Include whatever you already know about it. "
+                "The richer the question, the richer the answer."
+            )
+        ),
+    ],
+    deep: Annotated[
+        bool,
+        Field(
+            description=(
+                "Quick searches instantly. Deep is an agent — traverses, "
+                "reasons, expands. Prompt it like briefing a researcher; "
+                "detail drives quality."
+            )
+        ),
+    ] = False,
+) -> str:
+    """How you think back — use it freely, for anything. What's \
+found gets read and your question gets answered, so what you \
+ask shapes what comes back. Mentioning when something happened \
+sharpens results. Quick by default — deep when you need to \
+trace threads across many memories."""
+    # ENV override: quick or deep forces the mode regardless of parameter
+    use_deep = deep
+    if RECALL_MODE == "quick":
+        use_deep = False
+    elif RECALL_MODE == "deep":
+        use_deep = True
+    # else "auto" — trust the parameter
 
-    Returns:
-        List of ToolDef objects ready to pass to OmniTool's tool_defs parameter.
-    """
-    tools = await client.list_tools()
-    tool_defs = []
+    if use_deep:
+        return await _do_deep_recall(query)
+    else:
+        return await _do_quick_recall(query)
 
-    for tool in tools:
-        # Apply filter
-        if tool_filter and tool.name not in tool_filter:
-            continue
 
-        # Build local name with optional prefix
-        local_name = f"{prefix}_{tool.name}" if prefix else tool.name
+# ─── Entrypoint ─────────────────────────────────────────
 
-        # Convert schema to params
-        try:
-            params = schema_to_params(tool.inputSchema or {})
-        except Exception as e:
-            print(f"[remote] Skipping {tool.name}: bad schema — {e}")
-            continue
+def main():
+    mcp.run()
 
-        # Create per-call proxy (stores URL, not client)
-        func = _make_proxy(url, tool.name)
 
-        tool_defs.append(ToolDef(
-            name=local_name,
-            func=func,
-            docstring=tool.description or "",
-            params=params,
-        ))
-
-    return tool_defs
+if __name__ == "__main__":
+    main()
