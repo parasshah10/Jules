@@ -279,7 +279,7 @@ class OmniTool:
         This is the most token-sensitive piece — kept tight on purpose.
         """
         lines = [
-            'Additional capabilities beyond the primary tools. Access them as actions here.',
+            'Call THIS tool with action + params to use these capabilities.',
             '',
             'action="tool_name"  params={...arguments...}',
             'action="find_tool"  params={"query": "what you need"}',
