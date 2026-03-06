@@ -1,0 +1,524 @@
+"""
+omnitool.py — Single-tool MCP gateway with lazy tool discovery via BM25 search.
+
+Wraps any number of plain functions into a single FastMCP tool.
+Primary tools are always available in the tool definition.
+Secondary tools are discoverable via natural-language search.
+
+Usage:
+    from fastmcp import FastMCP
+    from omnitool import OmniTool
+
+    mcp = FastMCP("my-server")
+
+    def create_file(path: str, content: str) -> str:
+        ...
+
+    def rename_file(old_path: str, new_path: str) -> str:
+        ...
+
+    OmniTool(
+        mcp=mcp,
+        tools=[create_file, rename_file, ...],
+        n_primary=3,   # first 3 get full definitions baked in; rest go to search index
+    )
+
+Dependencies:
+    Required : fastmcp
+    Optional : rank-bm25   (pip install rank-bm25)  — better search; falls back gracefully
+    Optional : pydantic                              — extracts Field() descriptions automatically
+"""
+
+from __future__ import annotations
+
+import inspect
+import json
+import re
+import difflib
+import types as _types
+import typing
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Tuple, get_type_hints
+
+# ── Optional dependencies ──────────────────────────────────────────────────────
+
+try:
+    from rank_bm25 import BM25Okapi as _BM25Okapi
+    _HAS_BM25 = True
+except ImportError:
+    _HAS_BM25 = False
+
+try:
+    from pydantic.fields import FieldInfo as _FieldInfo
+    _HAS_PYDANTIC = True
+except ImportError:
+    _HAS_PYDANTIC = False
+
+# Sentinel for "no default value provided"
+_MISSING = object()
+
+
+# ── Data classes ───────────────────────────────────────────────────────────────
+
+@dataclass
+class ParamDef:
+    name: str
+    type_str: str        # compact string: "str", "int", "list[str]", etc.
+    description: str     # from Pydantic Field() or empty
+    default: Any         # _MISSING if no default
+    optional: bool       # True if Optional[X], or has a default
+    has_default: bool    # True if a default value exists
+
+
+@dataclass
+class ToolDef:
+    name: str
+    func: Callable
+    docstring: str
+    params: List[ParamDef]
+
+    def index_text(self) -> str:
+        """All searchable text for this tool, flattened into one string."""
+        parts = [
+            self.name,
+            self.name.replace('_', ' '),
+            self.docstring or '',
+        ]
+        for p in self.params:
+            parts.append(p.name.replace('_', ' '))
+            if p.description:
+                parts.append(p.description)
+        return ' '.join(filter(None, parts))
+
+
+# ── Main class ─────────────────────────────────────────────────────────────────
+
+class OmniTool:
+    """
+    Registers a single FastMCP tool that routes to any wrapped function.
+    Primary tools are fully described in the tool definition.
+    Secondary tools are discovered via natural-language BM25 search.
+    """
+
+    def __init__(
+        self,
+        mcp: Any,
+        tools: List[Callable],
+        n_primary: int = 3,
+        show_index: bool = False,
+    ):
+        """
+        Args:
+            mcp:          FastMCP instance to register the tool on.
+            tools:        List of plain functions to wrap. Order = priority.
+            n_primary:    How many functions (from the start of the list) get
+                          full definitions baked into the tool description.
+                          The rest go into the BM25 search index.
+            show_index:   If True, append a compact name-only index of secondary
+                          tools to the description (costs tokens, optional).
+        """
+        self.mcp = mcp
+        self.n_primary = n_primary
+        self.show_index = show_index
+
+        # Introspect everything up front
+        self._tool_defs: List[ToolDef] = [self._introspect(fn) for fn in tools]
+        self._tool_map: Dict[str, ToolDef] = {td.name: td for td in self._tool_defs}
+
+        # Split primary vs secondary
+        self._primary: List[ToolDef] = self._tool_defs[:n_primary]
+        self._secondary: List[ToolDef] = self._tool_defs[n_primary:]
+
+        # Build BM25 index over secondary tools
+        self._bm25: Any = None
+        self._build_index()
+
+        # Register single tool with FastMCP
+        self._register()
+
+    # ── Introspection ──────────────────────────────────────────────────────────
+
+    def _introspect(self, fn: Callable) -> ToolDef:
+        """Extract full parameter and docstring metadata from a function."""
+        name = fn.__name__
+        docstring = (inspect.getdoc(fn) or '').strip()
+
+        sig = inspect.signature(fn)
+        try:
+            hints = get_type_hints(fn, include_extras=True)
+        except Exception:
+            hints = {}
+
+        params: List[ParamDef] = []
+        for pname, param in sig.parameters.items():
+            annotation = hints.get(pname, inspect.Parameter.empty)
+
+            # Pull Field() description out of Annotated[T, Field(description="...")]
+            description = ''
+            if _HAS_PYDANTIC and hasattr(annotation, '__metadata__'):
+                for meta in annotation.__metadata__:
+                    if isinstance(meta, _FieldInfo) and meta.description:
+                        description = meta.description
+                        break
+
+            # Strip Annotated wrapper to get the real type
+            base_type = annotation
+            if hasattr(annotation, '__args__') and hasattr(annotation, '__metadata__'):
+                base_type = annotation.__args__[0]
+
+            type_str = self._type_to_str(base_type)
+            has_default = param.default is not inspect.Parameter.empty
+            optional = has_default or self._is_optional(base_type)
+            default = param.default if has_default else _MISSING
+
+            params.append(ParamDef(
+                name=pname,
+                type_str=type_str,
+                description=description,
+                default=default,
+                optional=optional,
+                has_default=has_default,
+            ))
+
+        return ToolDef(name=name, func=fn, docstring=docstring, params=params)
+
+    def _type_to_str(self, annotation: Any) -> str:
+        """Convert a type annotation to a compact readable string."""
+        if annotation is inspect.Parameter.empty or annotation is None:
+            return 'any'
+
+        origin = getattr(annotation, '__origin__', None)
+        args = getattr(annotation, '__args__', ())
+
+        # Union / Optional  (typing.Union and Python 3.10+ X | Y)
+        if origin is typing.Union:
+            non_none = [a for a in args if a is not type(None)]
+            return self._type_to_str(non_none[0]) if len(non_none) == 1 else 'any'
+
+        # Python 3.10+ union syntax: str | None  →  types.UnionType
+        if isinstance(annotation, getattr(_types, 'UnionType', type(None))):
+            non_none = [a for a in getattr(annotation, '__args__', ()) if a is not type(None)]
+            return self._type_to_str(non_none[0]) if len(non_none) == 1 else 'any'
+
+        # List
+        if origin is list:
+            return f'list[{self._type_to_str(args[0])}]' if args else 'list'
+
+        # Dict
+        if origin is dict:
+            return 'dict'
+
+        # Primitives
+        _primitives = {str: 'str', int: 'int', float: 'float', bool: 'bool'}
+        if annotation in _primitives:
+            return _primitives[annotation]
+
+        if hasattr(annotation, '__name__'):
+            return annotation.__name__
+
+        return 'any'
+
+    def _is_optional(self, annotation: Any) -> bool:
+        """Return True if the annotation is Optional[X] or X | None."""
+        origin = getattr(annotation, '__origin__', None)
+        args = getattr(annotation, '__args__', ())
+
+        if origin is typing.Union and type(None) in args:
+            return True
+
+        # Python 3.10+ union syntax
+        if isinstance(annotation, getattr(_types, 'UnionType', type(None))):
+            return type(None) in getattr(annotation, '__args__', ())
+
+        return False
+
+    # ── Compact DSL Renderer ───────────────────────────────────────────────────
+
+    def _render_compact(self, td: ToolDef) -> str:
+        """
+        Render a ToolDef into compact DSL.
+
+        create_file(path: str, content: str, mode?: str="w")
+          Creates a file at the given path with the given content.
+          path: Destination file path.
+          mode: Write mode. Default: "w".
+        """
+        param_parts = []
+        for p in td.params:
+            marker = '?' if p.optional else ''
+            s = f'{p.name}{marker}: {p.type_str}'
+            if p.has_default and p.default is not _MISSING and p.default is not None:
+                if isinstance(p.default, bool):
+                    s += f'={str(p.default).lower()}'
+                elif isinstance(p.default, str):
+                    s += f'="{p.default}"'
+                else:
+                    s += f'={p.default}'
+            param_parts.append(s)
+
+        lines = [f'{td.name}({", ".join(param_parts)})']
+
+        # First line of docstring
+        if td.docstring:
+            first = td.docstring.split('\n')[0].strip()
+            if first:
+                lines.append(f'  {first}')
+
+        # Param descriptions (only if non-empty)
+        for p in td.params:
+            if p.description:
+                lines.append(f'  {p.name}: {p.description}')
+
+        return '\n'.join(lines)
+
+    # ── Description Builder ────────────────────────────────────────────────────
+
+    def _build_description(self) -> str:
+        """
+        Build the text registered as the FastMCP tool description.
+        This is the most token-sensitive piece — kept tight on purpose.
+        """
+        lines = [
+            'This is the ONLY interface available. All capabilities are accessed here as actions.',
+            '',
+            'action="tool_name"  params={...arguments...}',
+            'action="search"     params={"q": "natural language description of what you want"}',
+            '',
+            'ACTIONS:',
+        ]
+
+        for td in self._primary:
+            lines.append(self._render_compact(td))
+            lines.append('')
+
+        # Search is always a built-in action
+        lines.append('search(q: str)')
+        lines.append('  Find available actions by describing what you want to do.')
+        lines.append('  q: Natural language. e.g. "move a file", "send email with attachment"')
+        lines.append('     Describe the action — not a tool name you are guessing at.')
+
+        # Optional: show secondary tool names as a name-only index
+        if self.show_index and self._secondary:
+            lines.append('')
+            lines.append('MORE ACTIONS (use search for full details):')
+            lines.append('  ' + ', '.join(td.name for td in self._secondary))
+
+        return '\n'.join(lines)
+
+    # ── BM25 Index ─────────────────────────────────────────────────────────────
+
+    def _tokenize(self, text: str) -> List[str]:
+        """Split on whitespace and common delimiters; lowercase."""
+        tokens = re.split(r'[\s_\-./,;:()\[\]"\']+', text.lower())
+        return [t for t in tokens if t]
+
+    def _build_index(self) -> None:
+        """Build BM25 index over all secondary tools at init time."""
+        if not self._secondary or not _HAS_BM25:
+            return
+        corpus = [self._tokenize(td.index_text()) for td in self._secondary]
+        self._bm25 = _BM25Okapi(corpus)
+
+    def _search(self, q: str, top_k: int = 5) -> str:
+        """Run BM25 (or fallback) search and return compact DSL results."""
+        if not self._secondary:
+            return (
+                'No additional actions beyond the built-ins.\n'
+                f'Primary actions: {", ".join(td.name for td in self._primary)}'
+            )
+
+        query_tokens = self._tokenize(q)
+
+        if self._bm25 is not None:
+            scores = self._bm25.get_scores(query_tokens)
+            indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+            results = [
+                self._secondary[i]
+                for i in indices[:top_k]
+                if scores[i] > 0
+            ]
+        else:
+            # Fallback: simple token overlap when rank_bm25 is not installed
+            q_tokens = set(query_tokens)
+            scored = []
+            for td in self._secondary:
+                doc_tokens = set(self._tokenize(td.index_text()))
+                overlap = len(q_tokens & doc_tokens)
+                if overlap > 0:
+                    scored.append((overlap, td))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            results = [td for _, td in scored[:top_k]]
+
+        if not results:
+            return (
+                f'No actions found for "{q}".\n'
+                'Try different keywords or a broader natural-language description.\n'
+                f'Tip: action="search" params={{"q": "describe what you need"}}'
+            )
+
+        lines = [f'Found {len(results)} action(s) for "{q}":', '']
+        for td in results:
+            lines.append(self._render_compact(td))
+            lines.append('')
+        lines.append('To call one: action="<name>" params={...required arguments...}')
+        return '\n'.join(lines).strip()
+
+    # ── Forgiving JSON Parser ──────────────────────────────────────────────────
+
+    def _clean_json(self, text: str) -> str:
+        """Strip markdown fences and fix common LLM JSON mistakes."""
+        text = text.strip()
+        # Remove opening/closing markdown code fences
+        text = re.sub(r'^```(?:json)?\s*\n?', '', text)
+        text = re.sub(r'\n?```\s*$', '', text)
+        text = text.strip()
+        # Remove trailing commas before } or ]
+        text = re.sub(r',\s*([}\]])', r'\1', text)
+        return text
+
+    def _parse_call(self, action: str, params: Any) -> Tuple[str, dict]:
+        """
+        Normalize action + params regardless of how the model packaged them.
+
+        Handles:
+          - JSON blob stuffed into the action field
+          - Alternate key names: "tool", "tool_name", "name" in addition to "action"
+          - params passed as a JSON string instead of a dict
+          - Markdown fences around JSON
+          - Trailing commas in JSON
+          - None params
+        """
+        # Case: model stuffed the whole call as a JSON blob into action
+        stripped = action.strip()
+        if stripped.startswith(('{', '`')):
+            cleaned = self._clean_json(stripped)
+            try:
+                data = json.loads(cleaned)
+                action = (
+                    data.get('action')
+                    or data.get('tool')
+                    or data.get('tool_name')
+                    or data.get('name')
+                    or ''
+                )
+                params = (
+                    data.get('params')
+                    or data.get('parameters')
+                    or data.get('args')
+                    or {}
+                )
+            except json.JSONDecodeError:
+                pass  # action stays as-is, params stays as-is
+
+        # Case: params is a JSON string instead of a dict
+        if isinstance(params, str) and params.strip():
+            cleaned = self._clean_json(params)
+            try:
+                params = json.loads(cleaned)
+            except json.JSONDecodeError:
+                params = {}
+
+        if params is None:
+            params = {}
+
+        if not isinstance(params, dict):
+            params = {}
+
+        return action.strip(), self._coerce_params(params)
+
+    def _coerce_params(self, params: dict) -> dict:
+        """Coerce string "true"/"false" to bool."""
+        result = {}
+        for k, v in params.items():
+            if isinstance(v, str):
+                lower = v.lower()
+                if lower == 'true':
+                    result[k] = True
+                elif lower == 'false':
+                    result[k] = False
+                else:
+                    result[k] = v
+            else:
+                result[k] = v
+        return result
+
+    # ── Dispatcher ─────────────────────────────────────────────────────────────
+
+    def _dispatch(self, tool_name: str, params: dict) -> Any:
+        """Route a parsed call to the correct function or built-in."""
+
+        # Built-in: search
+        if tool_name == 'search':
+            q = (
+                params.get('q')
+                or params.get('query')
+                or params.get('search')
+                or params.get('term')
+                or ''
+            )
+            if not q:
+                return (
+                    'Provide a search query.\n'
+                    'Example: action="search" params={"q": "move a file"}'
+                )
+            return self._search(str(q))
+
+        # Look up tool
+        td = self._tool_map.get(tool_name)
+
+        if td is None:
+            close = difflib.get_close_matches(
+                tool_name, list(self._tool_map.keys()), n=1, cutoff=0.55
+            )
+            suggestion = f'\n  Did you mean: "{close[0]}"?' if close else ''
+            primary_list = ', '.join(t.name for t in self._primary)
+            return (
+                f'Unknown action "{tool_name}".{suggestion}\n'
+                f'Primary actions: {primary_list}, search\n'
+                f'Tip: action="search" params={{"q": "describe what you want to do"}}'
+            )
+
+        # Check required params
+        missing = [
+            p.name
+            for p in td.params
+            if not p.optional and not p.has_default and p.name not in params
+        ]
+        if missing:
+            return (
+                f'Missing required param(s) for "{tool_name}": {", ".join(missing)}\n'
+                f'Schema:\n{self._render_compact(td)}'
+            )
+
+        # Call the wrapped function
+        try:
+            return td.func(**params)
+        except TypeError as e:
+            return (
+                f'Parameter error calling "{tool_name}": {e}\n'
+                f'Schema:\n{self._render_compact(td)}'
+            )
+        except Exception as e:
+            return f'Error in "{tool_name}": {e}'
+
+    # ── FastMCP Registration ───────────────────────────────────────────────────
+
+    def _register(self) -> None:
+        """Register the single gateway tool with the FastMCP instance."""
+        description = self._build_description()
+        omni = self  # explicit capture for the closure
+
+        @self.mcp.tool(description=description)
+        def tools(action: str, params: Optional[Dict[str, Any]] = None) -> Any:
+            resolved = params if params is not None else {}
+            tool_name, parsed_params = omni._parse_call(action, resolved)
+
+            if not tool_name:
+                primary_list = ', '.join(td.name for td in omni._primary)
+                return (
+                    'No action specified.\n'
+                    f'Primary actions: {primary_list}, search\n'
+                    'Example: action="create_file" params={"path": "foo.txt", "content": "hello"}'
+                )
+
+            return omni._dispatch(tool_name, parsed_params)
