@@ -298,7 +298,7 @@ class OmniTool:
 
         # Search is always a built-in action
         lines.append('find_tool(query: str)')
-        lines.append('  Describe what you need to find the right action.')
+        lines.append('  Returns matching actions and how to call them.')
 
         return '\n'.join(lines)
 
