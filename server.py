@@ -28,6 +28,9 @@ import time
 import uuid
 import re
 import os
+import random
+import math
+import concurrent.futures
 from omnitool import OmniTool
 
 # ─── Configuration ──────────────────────────────────────
@@ -277,6 +280,7 @@ async def _retain_background(body: dict):
         print(f"[retain] Error: {e}")
 
 
+@mcp.tool
 async def retain(
     content: Annotated[
         str,
@@ -419,6 +423,7 @@ async def _do_deep_recall(query: str) -> str:
         return f"Error: {e}"
 
 
+@mcp.tool
 async def recall(
     query: Annotated[
         str,
@@ -461,6 +466,7 @@ trace threads across many memories."""
 
 
 # ─── Research ───────────────────────────────────────────
+@mcp.tool
 async def research(
     prompt: Annotated[
         Optional[str],
@@ -537,11 +543,191 @@ be thorough about objectives and format."""
         )
 
 
+# ─── YouTube Transcript ─────────────────────────────────
+
+def _generate_random_headers():
+    """Generate randomized headers to simulate a new user."""
+    user_agents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
+    ]
+    current_timestamp_ms = int(time.time() * 1000)
+    anonymous_user_id = uuid.uuid4().hex
+    track_user_id = f"G-{current_timestamp_ms + random.randint(1, 1000)}"
+    uab_collina = f"{current_timestamp_ms}{random.randint(10**12, 10**13 - 1)}"
+    sbox_guid = f"MTc1MDQyNjM3OXw{random.randint(100, 999)}|{random.randint(100000000, 999999999)}"
+    g_state = f'{{"i_p":{current_timestamp_ms + random.randint(1, 1000)},"i_l":1}}'
+    cookie_string = (
+        f"sbox-guid={sbox_guid}; "
+        f"_uab_collina={uab_collina}; "
+        f"_trackUserId={track_user_id}; "
+        f"anonymous_user_id={anonymous_user_id}; "
+        f"is_first_visit=true; "
+        f"g_state={g_state}"
+    )
+    return {
+        'User-Agent': random.choice(user_agents),
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate, br, zstd',
+        'Connection': 'keep-alive',
+        'Referer': 'https://notegpt.io/youtube-transcript-generator',
+        'Cookie': cookie_string,
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-origin',
+        'Priority': 'u=0',
+        'TE': 'trailers',
+    }
+
+
+def _extract_video_id(url_or_id: str) -> str:
+    """Extract video ID from YouTube URL or return if already an ID."""
+    url_or_id = url_or_id.strip()
+    id_pattern = r'^[\w-]{11}$'
+    if re.match(id_pattern, url_or_id) and not ('youtube.com' in url_or_id or 'youtu.be' in url_or_id):
+        return url_or_id
+    patterns = [
+        r'(?:youtube\.com\/watch\?v=)([\w-]{11})',
+        r'(?:youtube\.com\/embed\/)([\w-]{11})',
+        r'(?:youtu\.be\/)([\w-]{11})',
+        r'(?:youtube\.com\/v\/)([\w-]{11})',
+        r'(?:youtube\.com\/shorts\/)([\w-]{11})',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url_or_id)
+        if match:
+            return match.group(1)
+    if re.match(id_pattern, url_or_id):
+        return url_or_id
+    raise ValueError(f"Invalid YouTube URL or video ID: {url_or_id}")
+
+
+def _fetch_single_transcript(video_id: str, include_timestamps: bool) -> str:
+    """Fetch and format a single video transcript."""
+    api_url = 'https://notegpt.io/api/v2/video-transcript'
+    params = {'platform': 'youtube', 'video_id': video_id}
+    try:
+        headers = _generate_random_headers()
+        response = requests.get(api_url, params=params, headers=headers, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        if data.get('code') != 100000:
+            return f"Error for video {video_id}: API error - {data.get('message', 'Unknown error')}"
+        video_info = data.get('data', {}).get('videoInfo', {})
+        video_title = video_info.get('name', 'Unknown Title')
+        channel_name = video_info.get('author', 'Unknown Channel')
+        transcripts = data.get('data', {}).get('transcripts', {})
+        transcript_entries = None
+        for lang_code in ['en', 'en_auto']:
+            if lang_code in transcripts:
+                transcript_entries = transcripts[lang_code].get('custom', [])
+                break
+        if not transcript_entries and transcripts:
+            first_lang = next(iter(transcripts.values()))
+            transcript_entries = first_lang.get('custom', [])
+        if not transcript_entries:
+            return f"Error for video {video_id}: No transcript available."
+        result_parts = [f"Title: {video_title}", f"Channel: {channel_name}", f"Video ID: {video_id}", "\n---"]
+        if include_timestamps:
+            formatted_transcript = "\n\n".join([f"[{entry['start']}] {entry['text']}" for entry in transcript_entries])
+            result_parts.append(formatted_transcript)
+        else:
+            result_parts.append(" ".join(entry['text'] for entry in transcript_entries))
+        return "\n".join(result_parts)
+    except requests.exceptions.HTTPError as e:
+        return f"Error for video {video_id}: HTTP error - {e}"
+    except requests.exceptions.RequestException as e:
+        return f"Error for video {video_id}: Network error - {e}"
+    except Exception as e:
+        return f"Error for video {video_id}: Unexpected error - {e}"
+
+
+def get_youtube_transcript(
+    video_urls_or_ids: Annotated[
+        str,
+        Field(
+            description=(
+                "YouTube URL, video ID, or comma-separated list of "
+                "URLs/IDs to fetch transcripts from."
+            )
+        ),
+    ],
+    include_timestamps: Annotated[
+        bool,
+        Field(description="Include timestamps in the output."),
+    ] = False,
+) -> str:
+    """Fetch transcript text from one or more YouTube videos. Supports
+    single URLs, video IDs, or comma-separated lists. Fetches in parallel
+    when multiple videos are requested."""
+    inputs = [item.strip() for item in video_urls_or_ids.split(',')]
+    video_ids = []
+    errors = []
+    for item in inputs:
+        try:
+            video_ids.append(_extract_video_id(item))
+        except ValueError as e:
+            errors.append(str(e))
+    all_results = []
+    if errors:
+        all_results.append("--- INPUT ERRORS ---\n" + "\n".join(errors))
+    if not video_ids:
+        if not errors:
+            return "Error: No valid video URLs or IDs were provided."
+        return "\n".join(all_results)
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future_to_video = {
+            executor.submit(_fetch_single_transcript, vid, include_timestamps): vid
+            for vid in video_ids
+        }
+        for future in concurrent.futures.as_completed(future_to_video):
+            all_results.append(future.result())
+    return "\n\n--- --- ---\n\n".join(all_results)
+
+
+# ─── Calculator ─────────────────────────────────────────
+
+def calculate(
+    expression: Annotated[
+        str,
+        Field(
+            description=(
+                "Math expression to evaluate. Supports arithmetic, "
+                "powers (**), and functions: sqrt, log, log10, sin, "
+                "cos, tan, abs, round, min, max, ceil, floor. "
+                "Constants: pi, e."
+            )
+        ),
+    ],
+) -> str:
+    """Evaluate a mathematical expression safely. No code execution —
+    only math operations and common functions."""
+    allowed = {
+        'abs': abs, 'round': round, 'min': min, 'max': max,
+        'sum': sum, 'pow': pow, 'int': int, 'float': float,
+        'pi': math.pi, 'e': math.e,
+        'sqrt': math.sqrt, 'log': math.log, 'log10': math.log10,
+        'sin': math.sin, 'cos': math.cos, 'tan': math.tan,
+        'ceil': math.ceil, 'floor': math.floor,
+    }
+    try:
+        result = eval(expression, {"__builtins__": {}}, allowed)
+        return str(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
 # ─── OmniTool Registration ─────────────────────────────
+
 OmniTool(
     mcp=mcp,
-    tools=[retain, recall, research],
-    n_primary=3,
+    tools=[get_youtube_transcript, calculate],
+    n_primary=0,
+    show_index=True,
 )
 
 # ─── Entrypoint ─────────────────────────────────────────
