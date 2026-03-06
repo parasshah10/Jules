@@ -6,8 +6,7 @@ dependencies = [
     "fastmcp",
     "requests",
     "openai",
-    "rank-bm25",
-    "pydantic"
+    "rank-bm25"
 ]
 
 [project.scripts]
