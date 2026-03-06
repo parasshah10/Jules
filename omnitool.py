@@ -279,27 +279,20 @@ class OmniTool:
         This is the most token-sensitive piece — kept tight on purpose.
         """
         lines = [
-            'Call THIS tool with action + params to use these capabilities.',
-            '',
-            'action="tool_name"  params={...arguments...}',
-            'action="find_tool"  params={"query": "what you need"}',
-            '',
-            'ACTIONS:',
+            'Call THIS tool with action + params',
+            'MAKE SURE to LEARN what tools exist and their schema via find_tool before calling them if you havent already',
+            'action="tool_name" params={...arguments...}',
         ]
 
         for td in self._primary:
             lines.append(self._render_compact(td))
-            lines.append('')
 
-        # Show available actions before search docs — survives truncation
+        # Show available actions
         if self.show_index and self._secondary:
-            lines.append('AVAILABLE: ' + ', '.join(td.name for td in self._secondary))
-            lines.append('')
+            lines.append('ACTIONS AVAILABLE: ' + ', '.join(td.name for td in self._secondary))
 
-        # Search is always a built-in action
-        lines.append('find_tool(query: str)')
-        lines.append('  Returns matching actions and how to call them.')
-        lines.append('  Always find_tool before calling — never guess params.')
+        # find_tool is always available
+        lines.append('find_tool(query: str) Returns matching actions and their schema/params')
 
         return '\n'.join(lines)
 
