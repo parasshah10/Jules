@@ -466,7 +466,6 @@ trace threads across many memories."""
 
 
 # ─── Research ───────────────────────────────────────────
-@mcp.tool
 async def research(
     prompt: Annotated[
         Optional[str],
@@ -725,7 +724,7 @@ def calculate(
 
 OmniTool(
     mcp=mcp,
-    tools=[get_youtube_transcript, calculate],
+    tools=[research, get_youtube_transcript, calculate],
     n_primary=0,
     show_index=True,
 )
