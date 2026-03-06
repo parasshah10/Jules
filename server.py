@@ -28,6 +28,7 @@ import time
 import uuid
 import re
 import os
+from omnitool import OmniTool
 
 # ─── Configuration ──────────────────────────────────────
 HINDSIGHT_URL = os.environ.get("HINDSIGHT_URL")
@@ -276,7 +277,6 @@ async def _retain_background(body: dict):
         print(f"[retain] Error: {e}")
 
 
-@mcp.tool
 async def retain(
     content: Annotated[
         str,
@@ -419,7 +419,6 @@ async def _do_deep_recall(query: str) -> str:
         return f"Error: {e}"
 
 
-@mcp.tool
 async def recall(
     query: Annotated[
         str,
@@ -462,7 +461,6 @@ trace threads across many memories."""
 
 
 # ─── Research ───────────────────────────────────────────
-@mcp.tool
 async def research(
     prompt: Annotated[
         Optional[str],
@@ -538,6 +536,13 @@ be thorough about objectives and format."""
             "or a task_id to check results."
         )
 
+
+# ─── OmniTool Registration ─────────────────────────────
+OmniTool(
+    mcp=mcp,
+    tools=[retain, recall, research],
+    n_primary=3,
+)
 
 # ─── Entrypoint ─────────────────────────────────────────
 def main():
