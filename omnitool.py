@@ -444,7 +444,7 @@ class OmniTool:
 
     # ── Dispatcher ─────────────────────────────────────────────────────────────
 
-    def _dispatch(self, tool_name: str, params: dict) -> Any:
+    async def _dispatch(self, tool_name: str, params: dict) -> Any:
         """Route a parsed call to the correct function or built-in."""
 
         # Built-in: search
@@ -492,7 +492,10 @@ class OmniTool:
 
         # Call the wrapped function
         try:
-            return td.func(**params)
+            if inspect.iscoroutinefunction(td.func):
+                return await td.func(**params)
+            else:
+                return td.func(**params)
         except TypeError as e:
             return (
                 f'Parameter error calling "{tool_name}": {e}\n'
@@ -509,7 +512,7 @@ class OmniTool:
         omni = self  # explicit capture for the closure
 
         @self.mcp.tool(description=description)
-        def tools(action: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        async def tools(action: str, params: Optional[Dict[str, Any]] = None) -> Any:
             resolved = params if params is not None else {}
             tool_name, parsed_params = omni._parse_call(action, resolved)
 
@@ -521,4 +524,4 @@ class OmniTool:
                     'Example: action="create_file" params={"path": "foo.txt", "content": "hello"}'
                 )
 
-            return omni._dispatch(tool_name, parsed_params)
+            return await omni._dispatch(tool_name, parsed_params)
