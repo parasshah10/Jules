@@ -282,7 +282,7 @@ class OmniTool:
             'Additional capabilities beyond the primary tools. Access them as actions here.',
             '',
             'action="tool_name"  params={...arguments...}',
-            'action="search"     params={"q": "natural language description of what you want"}',
+            'action="find_tool"  params={"query": "what you need"}',
             '',
             'ACTIONS:',
         ]
@@ -291,17 +291,14 @@ class OmniTool:
             lines.append(self._render_compact(td))
             lines.append('')
 
-        # Search is always a built-in action
-        lines.append('search(q: str)')
-        lines.append('  Find available actions by describing what you want to do.')
-        lines.append('  q: Natural language. e.g. "move a file", "send email with attachment"')
-        lines.append('     Describe the action — not a tool name you are guessing at.')
-
-        # Optional: show secondary tool names as a name-only index
+        # Show available actions before search docs — survives truncation
         if self.show_index and self._secondary:
+            lines.append('AVAILABLE: ' + ', '.join(td.name for td in self._secondary))
             lines.append('')
-            lines.append('MORE ACTIONS (use search for full details):')
-            lines.append('  ' + ', '.join(td.name for td in self._secondary))
+
+        # Search is always a built-in action
+        lines.append('find_tool(query: str)')
+        lines.append('  Describe what you need to find the right action.')
 
         return '\n'.join(lines)
 
@@ -353,7 +350,7 @@ class OmniTool:
             return (
                 f'No actions found for "{q}".\n'
                 'Try different keywords or a broader natural-language description.\n'
-                f'Tip: action="search" params={{"q": "describe what you need"}}'
+                f'Tip: action="find_tool" params={{"query": "describe what you need"}}'
             )
 
         lines = [f'Found {len(results)} action(s) for "{q}":', '']
@@ -448,7 +445,7 @@ class OmniTool:
         """Route a parsed call to the correct function or built-in."""
 
         # Built-in: search
-        if tool_name == 'search':
+        if tool_name == 'find_tool':
             q = (
                 params.get('q')
                 or params.get('query')
@@ -459,7 +456,7 @@ class OmniTool:
             if not q:
                 return (
                     'Provide a search query.\n'
-                    'Example: action="search" params={"q": "move a file"}'
+                    'Example: action="find_tool" params={"query": "move a file"}'
                 )
             return self._search(str(q))
 
@@ -474,8 +471,8 @@ class OmniTool:
             primary_list = ', '.join(t.name for t in self._primary)
             return (
                 f'Unknown action "{tool_name}".{suggestion}\n'
-                f'Primary actions: {primary_list}, search\n'
-                f'Tip: action="search" params={{"q": "describe what you want to do"}}'
+                f'Primary actions: {primary_list}, find_tool\n'
+                f'Tip: action="find_tool" params={{"query": "describe what you want to do"}}'
             )
 
         # Check required params
@@ -520,7 +517,7 @@ class OmniTool:
                 primary_list = ', '.join(td.name for td in omni._primary)
                 return (
                     'No action specified.\n'
-                    f'Primary actions: {primary_list}, search\n'
+                    f'Primary actions: {primary_list}, find_tool\n'
                     'Example: action="create_file" params={"path": "foo.txt", "content": "hello"}'
                 )
 
