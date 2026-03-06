@@ -38,7 +38,7 @@ import difflib
 import types as _types
 import typing
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple, get_type_hints
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, get_type_hints
 
 # ── Optional dependencies ──────────────────────────────────────────────────────
 
@@ -103,27 +103,56 @@ class OmniTool:
     def __init__(
         self,
         mcp: Any,
-        tools: List[Callable],
+        tools: Optional[List[Callable]] = None,
+        tool_defs: Optional[List[ToolDef]] = None,
+        refresh_callback: Optional[Callable] = None,
         n_primary: int = 3,
-        show_index: bool = False,
+        show_index: Union[bool, str] = False,
     ):
         """
         Args:
-            mcp:          FastMCP instance to register the tool on.
-            tools:        List of plain functions to wrap. Order = priority.
-            n_primary:    How many functions (from the start of the list) get
-                          full definitions baked into the tool description.
-                          The rest go into the BM25 search index.
-            show_index:   If True, append a compact name-only index of secondary
-                          tools to the description (costs tokens, optional).
+            mcp:              FastMCP instance to register the tool on.
+            tools:            List of plain functions to wrap. Order = priority.
+            tool_defs:        Pre-built ToolDef objects (e.g. from remote discovery).
+                              Skips introspection — goes straight into the index.
+            refresh_callback: Async function returning list[ToolDef]. If provided,
+                              a 'refresh' action is added that re-discovers remote
+                              tools and rebuilds the index.
+            n_primary:        How many functions (from the start of the list) get
+                              full definitions baked into the tool description.
+                              The rest go into the BM25 search index.
+            show_index:       False = hide, True = auto-generate name list from
+                              secondary tools, str = use verbatim text.
         """
         self.mcp = mcp
         self.n_primary = n_primary
         self.show_index = show_index
 
-        # Introspect everything up front
-        self._tool_defs: List[ToolDef] = [self._introspect(fn) for fn in tools]
-        self._tool_map: Dict[str, ToolDef] = {td.name: td for td in self._tool_defs}
+        # Store for refresh
+        self._local_tools: List[Callable] = list(tools or [])
+        self._refresh_callback = refresh_callback
+
+        # Introspect local tools
+        self._tool_defs: List[ToolDef] = [self._introspect(fn) for fn in self._local_tools]
+
+        # Add pre-built remote tool defs
+        self._tool_defs.extend(tool_defs or [])
+
+        # Add refresh action if callback provided
+        if refresh_callback:
+            self._tool_defs.append(ToolDef(
+                name="refresh",
+                func=self._do_refresh,
+                docstring="Re-discover tools from remote servers. Use after remote servers restart or new tools are added.",
+                params=[],
+            ))
+
+        # Build tool map with collision detection
+        self._tool_map: Dict[str, ToolDef] = {}
+        for td in self._tool_defs:
+            if td.name in self._tool_map:
+                print(f"[omnitool] Warning: Tool name '{td.name}' collision — later definition wins. Use prefix to resolve.")
+            self._tool_map[td.name] = td
 
         # Split primary vs secondary
         self._primary: List[ToolDef] = self._tool_defs[:n_primary]
@@ -135,6 +164,36 @@ class OmniTool:
 
         # Register single tool with FastMCP
         self._register()
+
+    # ── Refresh ────────────────────────────────────────────────────────────────
+
+    async def _do_refresh(self) -> str:
+        """Re-run remote discovery and rebuild indexes."""
+        if not self._refresh_callback:
+            return "Refresh not available — no remote servers configured."
+        try:
+            new_remote_defs = await self._refresh_callback()
+        except Exception as e:
+            return f"Refresh failed: {e}"
+
+        # Rebuild: re-introspect locals + new remotes + refresh action
+        self._tool_defs = [self._introspect(fn) for fn in self._local_tools]
+        self._tool_defs.extend(new_remote_defs)
+        self._tool_defs.append(ToolDef(
+            name="refresh",
+            func=self._do_refresh,
+            docstring="Re-discover tools from remote servers. Use after remote servers restart or new tools are added.",
+            params=[],
+        ))
+
+        # Rebuild all indexes
+        self._tool_map = {td.name: td for td in self._tool_defs}
+        self._primary = self._tool_defs[:self.n_primary]
+        self._secondary = self._tool_defs[self.n_primary:]
+        self._build_index()
+
+        names = [td.name for td in self._tool_defs if td.name != "refresh"]
+        return f"Refreshed. {len(names)} tool(s): {', '.join(names)}"
 
     # ── Introspection ──────────────────────────────────────────────────────────
 
@@ -288,8 +347,11 @@ class OmniTool:
             lines.append(self._render_compact(td))
 
         # Show available actions
-        if self.show_index and self._secondary:
-            lines.append('ACTIONS AVAILABLE: ' + ', '.join(td.name for td in self._secondary))
+        if self.show_index:
+            if isinstance(self.show_index, str):
+                lines.append('ACTIONS AVAILABLE: ' + self.show_index)
+            elif self._secondary:
+                lines.append('ACTIONS AVAILABLE: ' + ', '.join(td.name for td in self._secondary))
 
         # find_tool is always available
         lines.append('find_tool(query: str) Returns matching actions and their schema/params')
@@ -438,7 +500,7 @@ class OmniTool:
     async def _dispatch(self, tool_name: str, params: dict) -> Any:
         """Route a parsed call to the correct function or built-in."""
 
-        # Built-in: search
+        # Built-in: find_tool
         if tool_name == 'find_tool':
             q = (
                 params.get('q')
