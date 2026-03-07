@@ -83,11 +83,12 @@ openai_client = (
 REMOTE_SERVERS = [
     {
         "url": os.environ.get("YOUTUBE_MCP_URL"),
-        # "prefix": "yt",
-        # "tools": ["get_youtube_video_transcript"],
     },
     {
         "url": os.environ.get("FOLIO_MCP_URL"),
+    },
+    {
+        "url": os.environ.get("DEEPWIKI_MCP_URL"),
     },
     {
         "url": os.environ.get("TOOLS_MCP_URL"),
