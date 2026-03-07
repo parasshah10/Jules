@@ -415,7 +415,7 @@ conversation is rich. The more fully you write, the more you'll
 have to draw on when you think back. Invest in the details —
 they're what make memories real.
 
-The toolbox has more — always find_tool first to see what's
+The toolbox has more — always find_tools first to see what's
 there and how to call them. World lookups → research (toolbox),
 not other search tools.
 
