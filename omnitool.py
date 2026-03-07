@@ -339,7 +339,7 @@ class OmniTool:
         """
         lines = [
             'Call THIS tool with action + params',
-            'MAKE SURE to LEARN what tools exist and their schema via find_tool before calling them if you havent already',
+            'MAKE SURE to LEARN what tools exist and their schema via find_tools before calling them if you havent already',
             'action="tool_name" params={...arguments...}',
         ]
 
@@ -353,8 +353,8 @@ class OmniTool:
             elif self._secondary:
                 lines.append('ACTIONS AVAILABLE: ' + ', '.join(td.name for td in self._secondary))
 
-        # find_tool is always available
-        lines.append('find_tool(query: str) Returns matching actions and their schema/params')
+        # find_tools is always available
+        lines.append('find_tools(query?: str) Returns matching actions and their schema/params')
 
         return '\n'.join(lines)
 
@@ -406,7 +406,7 @@ class OmniTool:
             return (
                 f'No actions found for "{q}".\n'
                 'Try different keywords or a broader natural-language description.\n'
-                f'Tip: action="find_tool" params={{"query": "describe what you need"}}'
+                f'Tip: action="find_tools" params={{"query": "describe what you need"}}'
             )
 
         lines = [f'Found {len(results)} action(s) for "{q}":', '']
@@ -500,8 +500,8 @@ class OmniTool:
     async def _dispatch(self, tool_name: str, params: dict) -> Any:
         """Route a parsed call to the correct function or built-in."""
 
-        # Built-in: find_tool
-        if tool_name == 'find_tool':
+        # Built-in: find_tools
+        if tool_name == 'find_tools':
             q = (
                 params.get('q')
                 or params.get('query')
@@ -510,10 +510,15 @@ class OmniTool:
                 or ''
             )
             if not q:
-                return (
-                    'Provide a search query.\n'
-                    'Example: action="find_tool" params={"query": "move a file"}'
-                )
+                # No query = list all available tools
+                if not self._secondary:
+                    return 'No additional actions available.'
+                lines = [f'All available actions ({len(self._secondary)}):', '']
+                for td in self._secondary:
+                    lines.append(self._render_compact(td))
+                    lines.append('')
+                lines.append('To call one: action="<name>" params={...required arguments...}')
+                return '\n'.join(lines).strip()
             return self._search(str(q))
 
         # Look up tool
@@ -527,8 +532,8 @@ class OmniTool:
             primary_list = ', '.join(t.name for t in self._primary)
             return (
                 f'Unknown action "{tool_name}".{suggestion}\n'
-                f'Primary actions: {primary_list}, find_tool\n'
-                f'Tip: action="find_tool" params={{"query": "describe what you want to do"}}'
+                f'Primary actions: {primary_list}, find_tools\n'
+                f'Tip: action="find_tools" params={{"query": "describe what you want to do"}}'
             )
 
         # Check required params
@@ -573,7 +578,7 @@ class OmniTool:
                 primary_list = ', '.join(td.name for td in omni._primary)
                 return (
                     'No action specified.\n'
-                    f'Primary actions: {primary_list}, find_tool\n'
+                    f'Primary actions: {primary_list}, find_tools\n'
                     'Example: action="create_file" params={"path": "foo.txt", "content": "hello"}'
                 )
 
