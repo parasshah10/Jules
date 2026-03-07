@@ -80,20 +80,33 @@ openai_client = (
 
 # ─── Remote MCP Servers ─────────────────────────────────
 
-REMOTE_SERVERS = [
-    {
-        "url": os.environ.get("YOUTUBE_MCP_URL"),
-    },
-    {
-        "url": os.environ.get("FOLIO_MCP_URL"),
-    },
-    {
-        "url": os.environ.get("DEEPWIKI_MCP_URL"),
-    },
-    {
-        "url": os.environ.get("TOOLS_MCP_URL"),
-    },
-]
+def _discover_remote_configs() -> list[dict]:
+    """Build remote server configs from MCP_REMOTE_*_URL env vars.
+    
+    Convention:
+        MCP_REMOTE_{NAME}_URL     — Server URL (required, presence = server exists)
+        MCP_REMOTE_{NAME}_PREFIX  — Prefix for tool names from this server (optional)
+        MCP_REMOTE_{NAME}_TOOLS   — Comma-separated tool name filter (optional)
+    """
+    servers = {}
+    for key, value in os.environ.items():
+        if not key.startswith("MCP_REMOTE_") or not value:
+            continue
+        rest = key[len("MCP_REMOTE_"):]
+        if rest.endswith("_URL"):
+            name = rest[:-4]
+            servers.setdefault(name, {})["url"] = value
+        elif rest.endswith("_PREFIX"):
+            name = rest[:-7]
+            servers.setdefault(name, {})["prefix"] = value
+        elif rest.endswith("_TOOLS"):
+            name = rest[:-6]
+            servers.setdefault(name, {})["tools"] = [
+                t.strip() for t in value.split(",") if t.strip()
+            ]
+    return [cfg for cfg in servers.values() if cfg.get("url")]
+
+REMOTE_SERVERS = _discover_remote_configs()
 
 # ─── Quick Recall Synthesis ─────────────────────────────
 
