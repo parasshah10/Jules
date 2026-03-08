@@ -510,14 +510,35 @@ class OmniTool:
                 or ''
             )
             if not q:
-                # No query = list all available tools
+                # No query = list all available tools (compressed, grouped by prefix)
                 if not self._secondary:
                     return 'No additional actions available.'
-                lines = [f'All available actions ({len(self._secondary)}):', '']
+                # Group tools by prefix (prefix-toolname pattern via dash)
+                grouped: dict[str, list] = {}
+                ungrouped: list = []
                 for td in self._secondary:
-                    lines.append(self._render_compact(td))
+                    if '-' in td.name:
+                        prefix = td.name.split('-', 1)[0]
+                        grouped.setdefault(prefix, []).append(td)
+                    else:
+                        ungrouped.append(td)
+                lines = [f'All available actions ({len(self._secondary)}):', '']
+                # Grouped tools (with prefix)
+                for prefix, tools in grouped.items():
+                    lines.append(f'{prefix}:')
+                    for td in tools:
+                        first_line = (td.docstring or '').split('\n')[0].strip()
+                        desc = f' — {first_line}' if first_line else ''
+                        lines.append(f'  {td.name}{desc}')
                     lines.append('')
-                lines.append('To call one: action="<name>" params={...required arguments...}')
+                # Ungrouped tools (no prefix)
+                for td in ungrouped:
+                    first_line = (td.docstring or '').split('\n')[0].strip()
+                    desc = f' — {first_line}' if first_line else ''
+                    lines.append(f'{td.name}{desc}')
+                if ungrouped:
+                    lines.append('')
+                lines.append('Search for full schema: find_tools(query="what you need")')
                 return '\n'.join(lines).strip()
             return self._search(str(q))
 
