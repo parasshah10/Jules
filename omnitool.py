@@ -329,6 +329,37 @@ class OmniTool:
                 lines.append(f'  {p.name}: {p.description}')
 
         return '\n'.join(lines)
+    
+    def _render_full(self, td: ToolDef) -> str:
+        """
+        Render a ToolDef with full docstring — used for search results
+        where the LLM needs complete info to call the tool correctly.
+        """
+        param_parts = []
+        for p in td.params:
+            marker = '?' if p.optional else ''
+            s = f'{p.name}{marker}: {p.type_str}'
+            if p.has_default and p.default is not _MISSING and p.default is not None:
+                if isinstance(p.default, bool):
+                    s += f'={str(p.default).lower()}'
+                elif isinstance(p.default, str):
+                    s += f'="{p.default}"'
+                else:
+                    s += f'={p.default}'
+            param_parts.append(s)
+
+        lines = [f'{td.name}({", ".join(param_parts)})']
+
+        # Full docstring (not just first line)
+        if td.docstring:
+            lines.append(f'  {td.docstring}')
+
+        # Param descriptions (only if non-empty and not already covered in docstring)
+        for p in td.params:
+            if p.description:
+                lines.append(f'  {p.name}: {p.description}')
+
+        return '\n'.join(lines)
 
     # ── Description Builder ────────────────────────────────────────────────────
 
@@ -411,7 +442,7 @@ class OmniTool:
 
         lines = [f'Found {len(results)} action(s) for "{q}":', '']
         for td in results:
-            lines.append(self._render_compact(td))
+            lines.append(self._render_full(td))
             lines.append('')
         lines.append('To call one: action="<name>" params={...required arguments...}')
         return '\n'.join(lines).strip()
