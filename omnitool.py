@@ -354,7 +354,7 @@ class OmniTool:
                 lines.append('ACTIONS AVAILABLE: ' + ', '.join(td.name for td in self._secondary))
 
         # find_tools is always available
-        lines.append('find_tools(query?: str, limit?: int=5) Returns matching actions and their schema/params')
+        lines.append('find_tools(query?: str, limit?: int=5) Empty/* = list all (names only). With query = full schema/params. Use natural language.')
 
         return '\n'.join(lines)
 
@@ -509,7 +509,7 @@ class OmniTool:
                 or params.get('term')
                 or ''
             )
-            if not q:
+            if not q or q.strip() == '*':
                 # No query = list all available tools (compressed, grouped by prefix)
                 if not self._secondary:
                     return 'No additional actions available.'
