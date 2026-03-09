@@ -298,7 +298,7 @@ async def research(
         ),
     ] = None,
 ) -> str:
-    """Web and X platform research via Grok. Returns results \
+    """Agentic Web and X platform research via Claude. Returns results \
 directly when fast enough — otherwise hands back a task_id \
 to check later. Prompt quality determines output quality — \
 be thorough about objectives and format."""
