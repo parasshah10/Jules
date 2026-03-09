@@ -354,7 +354,7 @@ class OmniTool:
                 lines.append('ACTIONS AVAILABLE: ' + ', '.join(td.name for td in self._secondary))
 
         # find_tools is always available
-        lines.append('find_tools(query?: str) Returns matching actions and their schema/params')
+        lines.append('find_tools(query?: str, limit?: int=5) Returns matching actions and their schema/params')
 
         return '\n'.join(lines)
 
@@ -540,7 +540,12 @@ class OmniTool:
                     lines.append('')
                 lines.append('Search for full schema: find_tools(query="what you need")')
                 return '\n'.join(lines).strip()
-            return self._search(str(q))
+            limit = params.get('limit') or params.get('n') or params.get('count') or 5
+            try:
+                limit = max(1, min(int(limit), 50))
+            except (TypeError, ValueError):
+                limit = 5
+            return self._search(str(q), top_k=limit)
 
         # Look up tool
         td = self._tool_map.get(tool_name)
