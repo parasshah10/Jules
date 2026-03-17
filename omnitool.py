@@ -5,6 +5,10 @@ Wraps any number of plain functions into a single FastMCP tool.
 Primary tools are always available in the tool definition.
 Secondary tools are discoverable via natural-language search.
 
+Discovery is split into two actions:
+  find_tools  — broad, cheap: returns tool names ranked by relevance
+  get_schema  — precise, complete: returns full signatures and parameter details
+
 Usage:
     from fastmcp import FastMCP
     from omnitool import OmniTool
@@ -56,6 +60,11 @@ except ImportError:
 
 # Sentinel for "no default value provided"
 _MISSING = object()
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+
+_MAX_GROUP_PREVIEW = 5   # max tool names shown per group in compressed listing
+_DEFAULT_SEARCH_LIMIT = 10  # default results for find_tools search
 
 
 # ── Data classes ───────────────────────────────────────────────────────────────
@@ -116,7 +125,7 @@ class OmniTool:
             tool_defs:        Pre-built ToolDef objects (e.g. from remote discovery).
                               Skips introspection — goes straight into the index.
             refresh_callback: Async function returning list[ToolDef]. If provided,
-                              a 'refresh' action is added that re-discovers remote
+                              a 'refresh' tool is added that re-discovers remote
                               tools and rebuilds the index.
             n_primary:        How many functions (from the start of the list) get
                               full definitions baked into the tool description.
@@ -138,7 +147,7 @@ class OmniTool:
         # Add pre-built remote tool defs
         self._tool_defs.extend(tool_defs or [])
 
-        # Add refresh action if callback provided
+        # Add refresh tool if callback provided
         if refresh_callback:
             self._tool_defs.append(ToolDef(
                 name="refresh",
@@ -176,7 +185,7 @@ class OmniTool:
         except Exception as e:
             return f"Refresh failed: {e}"
 
-        # Rebuild: re-introspect locals + new remotes + refresh action
+        # Rebuild: re-introspect locals + new remotes + refresh tool
         self._tool_defs = [self._introspect(fn) for fn in self._local_tools]
         self._tool_defs.extend(new_remote_defs)
         self._tool_defs.append(ToolDef(
@@ -291,11 +300,15 @@ class OmniTool:
 
         return False
 
-    # ── Compact DSL Renderer ───────────────────────────────────────────────────
+    # ── Renderers ──────────────────────────────────────────────────────────────
+
+    def _render_brief(self, td: ToolDef) -> str:
+        """Just the tool name. No description, no parameters."""
+        return td.name
 
     def _render_compact(self, td: ToolDef) -> str:
         """
-        Render a ToolDef into compact DSL.
+        Compact DSL: signature + first docstring line + param descriptions.
 
         create_file(path: str, content: str, mode?: str="w")
           Creates a file at the given path with the given content.
@@ -329,11 +342,11 @@ class OmniTool:
                 lines.append(f'  {p.name}: {p.description}')
 
         return '\n'.join(lines)
-    
+
     def _render_full(self, td: ToolDef) -> str:
         """
-        Render a ToolDef with full docstring — used for search results
-        where the LLM needs complete info to call the tool correctly.
+        Full schema: signature + full docstring + all param descriptions.
+        Used by get_schema for complete tool documentation.
         """
         param_parts = []
         for p in td.params:
@@ -350,11 +363,11 @@ class OmniTool:
 
         lines = [f'{td.name}({", ".join(param_parts)})']
 
-        # Full docstring (not just first line)
+        # Full docstring
         if td.docstring:
             lines.append(f'  {td.docstring}')
 
-        # Param descriptions (only if non-empty and not already covered in docstring)
+        # Param descriptions
         for p in td.params:
             if p.description:
                 lines.append(f'  {p.name}: {p.description}')
@@ -369,23 +382,31 @@ class OmniTool:
         This is the most token-sensitive piece — kept tight on purpose.
         """
         lines = [
-            'Call THIS tool with action + params',
-            'MAKE SURE to LEARN what tools exist and their schema via find_tools before calling them if you havent already',
-            'action="tool_name" params={...arguments...}',
+            'Call THIS tool: tool="name" params={...}',
+            'find_tools to discover, get_schema for details, then call.',
         ]
 
+        # Primary tools — always shown with full compact definitions
         for td in self._primary:
             lines.append(self._render_compact(td))
 
-        # Show available actions
+        # Show available tools hint
         if self.show_index:
             if isinstance(self.show_index, str):
-                lines.append('ACTIONS AVAILABLE: ' + self.show_index)
+                lines.append('TOOLS AVAILABLE: ' + self.show_index)
             elif self._secondary:
-                lines.append('ACTIONS AVAILABLE: ' + ', '.join(td.name for td in self._secondary))
+                lines.append('TOOLS AVAILABLE: ' + ', '.join(td.name for td in self._secondary))
 
-        # find_tools is always available
-        lines.append('find_tools(query?: str, limit?: int=5) Empty/* = list all (names only). With query = full schema/params. Use natural language.')
+        # Discovery tools — always available
+        lines.append(
+            'find_tools(query?: str, limit?: int=10) '
+            'Names only. Empty/* = all grouped. Query = BM25 ranked.'
+        )
+        lines.append(
+            'get_schema(tools: str) '
+            'Full schema. Comma-separated names. '
+            'Example: get_schema("tool1, tool2")'
+        )
 
         return '\n'.join(lines)
 
@@ -403,12 +424,12 @@ class OmniTool:
         corpus = [self._tokenize(td.index_text()) for td in self._secondary]
         self._bm25 = _BM25Okapi(corpus)
 
-    def _search(self, q: str, top_k: int = 5) -> str:
-        """Run BM25 (or fallback) search and return compact DSL results."""
+    def _search(self, q: str, top_k: int = _DEFAULT_SEARCH_LIMIT) -> str:
+        """Run BM25 (or fallback) search and return names-only results."""
         if not self._secondary:
             return (
-                'No additional actions beyond the built-ins.\n'
-                f'Primary actions: {", ".join(td.name for td in self._primary)}'
+                'No additional tools beyond the built-ins.\n'
+                f'Primary tools: {", ".join(td.name for td in self._primary)}'
             )
 
         query_tokens = self._tokenize(q)
@@ -435,17 +456,24 @@ class OmniTool:
 
         if not results:
             return (
-                f'No actions found for "{q}".\n'
-                'Try different keywords or a broader natural-language description.\n'
-                f'Tip: action="find_tools" params={{"query": "describe what you need"}}'
+                f'No tools found for "{q}".\n'
+                'Try different keywords or a broader description.\n'
+                'Tip: find_tools() to see all available tools.'
             )
 
-        lines = [f'Found {len(results)} action(s) for "{q}":', '']
+        # Catalog size annotation
+        total = len(self._secondary)
+        if len(results) < total:
+            header = f'Found {len(results)} of {total} tools for "{q}":'
+        else:
+            header = f'Found {len(results)} tools for "{q}":'
+
+        lines = [header, '']
         for td in results:
-            lines.append(self._render_full(td))
-            lines.append('')
-        lines.append('To call one: action="<name>" params={...required arguments...}')
-        return '\n'.join(lines).strip()
+            lines.append(f'  {self._render_brief(td)}')
+        lines.append('')
+        lines.append('get_schema("tool1, tool2, ...") for details')
+        return '\n'.join(lines)
 
     # ── Forgiving JSON Parser ──────────────────────────────────────────────────
 
@@ -460,27 +488,27 @@ class OmniTool:
         text = re.sub(r',\s*([}\]])', r'\1', text)
         return text
 
-    def _parse_call(self, action: str, params: Any) -> Tuple[str, dict]:
+    def _parse_call(self, tool_param: str, params: Any) -> Tuple[str, dict]:
         """
-        Normalize action + params regardless of how the model packaged them.
+        Normalize tool + params regardless of how the model packaged them.
 
         Handles:
-          - JSON blob stuffed into the action field
-          - Alternate key names: "tool", "tool_name", "name" in addition to "action"
+          - JSON blob stuffed into the tool field
+          - Alternate key names: "tool", "action", "tool_name", "name"
           - params passed as a JSON string instead of a dict
           - Markdown fences around JSON
           - Trailing commas in JSON
           - None params
         """
-        # Case: model stuffed the whole call as a JSON blob into action
-        stripped = action.strip()
+        # Case: model stuffed the whole call as a JSON blob into tool param
+        stripped = tool_param.strip()
         if stripped.startswith(('{', '`')):
             cleaned = self._clean_json(stripped)
             try:
                 data = json.loads(cleaned)
-                action = (
-                    data.get('action')
-                    or data.get('tool')
+                tool_param = (
+                    data.get('tool')
+                    or data.get('action')
                     or data.get('tool_name')
                     or data.get('name')
                     or ''
@@ -492,7 +520,7 @@ class OmniTool:
                     or {}
                 )
             except json.JSONDecodeError:
-                pass  # action stays as-is, params stays as-is
+                pass  # tool_param stays as-is, params stays as-is
 
         # Case: params is a JSON string instead of a dict
         if isinstance(params, str) and params.strip():
@@ -508,7 +536,7 @@ class OmniTool:
         if not isinstance(params, dict):
             params = {}
 
-        return action.strip(), self._coerce_params(params)
+        return tool_param.strip(), self._coerce_params(params)
 
     def _coerce_params(self, params: dict) -> dict:
         """Coerce string "true"/"false" to bool."""
@@ -531,7 +559,8 @@ class OmniTool:
     async def _dispatch(self, tool_name: str, params: dict) -> Any:
         """Route a parsed call to the correct function or built-in."""
 
-        # Built-in: find_tools
+        # ── Built-in: find_tools ──────────────────────────────────────────
+
         if tool_name == 'find_tools':
             q = (
                 params.get('q')
@@ -540,45 +569,100 @@ class OmniTool:
                 or params.get('term')
                 or ''
             )
-            if not q or q.strip() == '*':
-                # No query = list all available tools (compressed, grouped by prefix)
-                if not self._secondary:
-                    return 'No additional actions available.'
-                # Group tools by prefix (prefix-toolname pattern via dash)
-                grouped: dict[str, list] = {}
-                ungrouped: list = []
-                for td in self._secondary:
-                    if '-' in td.name:
-                        prefix = td.name.split('-', 1)[0]
-                        grouped.setdefault(prefix, []).append(td)
-                    else:
-                        ungrouped.append(td)
-                lines = [f'All available actions ({len(self._secondary)}):', '']
-                # Grouped tools (with prefix)
-                for prefix, tools in grouped.items():
-                    lines.append(f'{prefix}:')
-                    for td in tools:
-                        first_line = (td.docstring or '').split('\n')[0].strip()
-                        desc = f' — {first_line}' if first_line else ''
-                        lines.append(f'  {td.name}{desc}')
-                    lines.append('')
-                # Ungrouped tools (no prefix)
-                for td in ungrouped:
-                    first_line = (td.docstring or '').split('\n')[0].strip()
-                    desc = f' — {first_line}' if first_line else ''
-                    lines.append(f'{td.name}{desc}')
-                if ungrouped:
-                    lines.append('')
-                lines.append('Search for full schema: find_tools(query="what you need")')
-                return '\n'.join(lines).strip()
-            limit = params.get('limit') or params.get('n') or params.get('count') or 5
+            limit = params.get('limit') or params.get('n') or params.get('count') or _DEFAULT_SEARCH_LIMIT
             try:
                 limit = max(1, min(int(limit), 50))
             except (TypeError, ValueError):
-                limit = 5
-            return self._search(str(q), top_k=limit)
+                limit = _DEFAULT_SEARCH_LIMIT
 
-        # Look up tool
+            # No query → compressed grouped listing (names only)
+            if not q or q.strip() == '*':
+                return self._list_all_compressed()
+
+            q = str(q).strip()
+
+            # Exact tool name match → confirm + redirect
+            if q in self._tool_map:
+                return (
+                    f'Tool found: {q}\n'
+                    f'get_schema("{q}") for full parameter details\n'
+                    f'tool="{q}" params={{...}} to call'
+                )
+
+            # Prefix/group match → list all names in group
+            prefix_matches = [
+                td for td in self._secondary
+                if td.name.startswith(q + '-') or td.name.startswith(q + '_')
+            ]
+            if len(prefix_matches) >= 3:
+                names = [td.name for td in prefix_matches]
+                lines = [f'{q} ({len(names)} tools):']
+                for name in names:
+                    lines.append(f'  {name}')
+                lines.append('')
+                lines.append(f'get_schema("{names[0]}, ...") for details')
+                return '\n'.join(lines)
+
+            # Natural language query → BM25 search (names only)
+            return self._search(q, top_k=limit)
+
+        # ── Built-in: get_schema ──────────────────────────────────────────
+
+        if tool_name == 'get_schema':
+            tools_param = (
+                params.get('tools')
+                or params.get('tool')
+                or params.get('names')
+                or params.get('name')
+                or ''
+            )
+
+            # Parse comma-separated string or list
+            if isinstance(tools_param, list):
+                names = [str(n).strip() for n in tools_param if str(n).strip()]
+            elif isinstance(tools_param, str):
+                names = [n.strip() for n in tools_param.split(',') if n.strip()]
+            else:
+                names = []
+
+            if not names:
+                return (
+                    'Provide tool name(s) to look up.\n'
+                    'Example: get_schema("research, firecrawl-firecrawl_scrape")\n'
+                    'Use find_tools() to discover available tools first.'
+                )
+
+            results = []
+            found_count = 0
+            for name in names:
+                td = self._tool_map.get(name)
+                if td:
+                    results.append(self._render_full(td))
+                    found_count += 1
+                else:
+                    close = difflib.get_close_matches(
+                        name, list(self._tool_map.keys()), n=3, cutoff=0.5
+                    )
+                    if close:
+                        suggestions = ', '.join(f'"{c}"' for c in close)
+                        results.append(f'"{name}" not found. Did you mean: {suggestions}?')
+                    else:
+                        results.append(f'"{name}" not found. Use find_tools(query="...") to search.')
+
+            # Build output
+            header = ''
+            if len(names) > 1:
+                header = f'Schema for {len(names)} tool(s):\n\n'
+
+            body = '\n\n'.join(results)
+            footer = ''
+            if found_count > 0:
+                footer = '\n\nTo call: tool="<name>" params={...}'
+
+            return (header + body + footer).strip()
+
+        # ── Tool lookup and dispatch ──────────────────────────────────────
+
         td = self._tool_map.get(tool_name)
 
         if td is None:
@@ -588,9 +672,9 @@ class OmniTool:
             suggestion = f'\n  Did you mean: "{close[0]}"?' if close else ''
             primary_list = ', '.join(t.name for t in self._primary)
             return (
-                f'Unknown action "{tool_name}".{suggestion}\n'
-                f'Primary actions: {primary_list}, find_tools\n'
-                f'Tip: action="find_tools" params={{"query": "describe what you want to do"}}'
+                f'Unknown tool "{tool_name}".{suggestion}\n'
+                f'Primary tools: {primary_list}, find_tools, get_schema\n'
+                f'Tip: find_tools(query="describe what you want to do")'
             )
 
         # Check required params
@@ -619,6 +703,45 @@ class OmniTool:
         except Exception as e:
             return f'Error in "{tool_name}": {e}'
 
+    # ── Compressed Listing ─────────────────────────────────────────────────────
+
+    def _list_all_compressed(self) -> str:
+        """Ultra-compressed listing: grouped tool names, no descriptions."""
+        if not self._secondary:
+            return 'No additional tools available.'
+
+        # Group tools by prefix (prefix-toolname pattern via dash)
+        grouped: Dict[str, List[str]] = {}
+        ungrouped: List[str] = []
+
+        for td in self._secondary:
+            if '-' in td.name:
+                prefix, short = td.name.split('-', 1)
+                grouped.setdefault(prefix, []).append(short)
+            else:
+                ungrouped.append(td.name)
+
+        lines = [f'All available tools ({len(self._secondary)}):', '']
+
+        # Grouped tools
+        for prefix, short_names in grouped.items():
+            count = len(short_names)
+            if count <= _MAX_GROUP_PREVIEW:
+                names_str = ', '.join(short_names)
+            else:
+                names_str = ', '.join(short_names[:_MAX_GROUP_PREVIEW]) + ', ...'
+            lines.append(f'{prefix} ({count}): {names_str}')
+
+        # Ungrouped tools
+        if ungrouped:
+            if grouped:
+                lines.append('')
+            lines.append(', '.join(ungrouped))
+
+        lines.append('')
+        lines.append('get_schema("tool1, tool2, ...") for details')
+        return '\n'.join(lines)
+
     # ── FastMCP Registration ───────────────────────────────────────────────────
 
     def _register(self) -> None:
@@ -627,16 +750,16 @@ class OmniTool:
         omni = self  # explicit capture for the closure
 
         @self.mcp.tool(description=description)
-        async def toolbox(action: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        async def toolbox(tool: str, params: Optional[Dict[str, Any]] = None) -> Any:
             resolved = params if params is not None else {}
-            tool_name, parsed_params = omni._parse_call(action, resolved)
+            tool_name, parsed_params = omni._parse_call(tool, resolved)
 
             if not tool_name:
                 primary_list = ', '.join(td.name for td in omni._primary)
                 return (
-                    'No action specified.\n'
-                    f'Primary actions: {primary_list}, find_tools\n'
-                    'Example: action="create_file" params={"path": "foo.txt", "content": "hello"}'
+                    'No tool specified.\n'
+                    f'Primary tools: {primary_list}, find_tools, get_schema\n'
+                    'Example: tool="find_tools" params={"query": "what you need"}'
                 )
 
             return await omni._dispatch(tool_name, parsed_params)
