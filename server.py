@@ -225,7 +225,11 @@ async def _synthesize_quick_recall(
         async for chunk in stream:
             if chunk.choices and chunk.choices[0].delta.content:
                 result += chunk.choices[0].delta.content
-        return result.strip()
+        result = re.sub(
+            r'<' + 'think' + r'>.*?</' + 'think' + r'>',
+            '', result, flags=re.DOTALL
+        ).strip()
+        return result
     except Exception as e:
         lines = []
         for f in facts:
@@ -512,7 +516,7 @@ async def _do_quick_recall(query: str) -> str:
     """Quick mode: single recall + LLM synthesis."""
     body = {
         "query": query,
-        "max_tokens": 32000,
+        "max_tokens": 64000,
         "budget": "high",
         "types": ["world", "experience", "observation"],
         "include": {"chunks": {}},
