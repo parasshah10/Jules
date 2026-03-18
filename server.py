@@ -211,7 +211,7 @@ async def _synthesize_quick_recall(
     user_prompt = "\n".join(parts)
 
     try:
-        response = await openai_client.chat.completions.create(
+        stream = await openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
@@ -219,8 +219,13 @@ async def _synthesize_quick_recall(
             ],
             max_tokens=10000,
             temperature=0.3,
+            stream=True,
         )
-        return response.choices[0].message.content.strip()
+        result = ""
+        async for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                result += chunk.choices[0].delta.content
+        return result.strip()
     except Exception as e:
         lines = []
         for f in facts:
