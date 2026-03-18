@@ -611,16 +611,16 @@ async def recall(
             )
         ),
     ],
-    deep: Annotated[
-        bool,
-        Field(
-            description=(
-                "Quick searches instantly. Deep is an agent — traverses, "
-                "reasons, expands. Prompt it like briefing a researcher; "
-                "detail drives quality."
-            )
-        ),
-    ] = False,
+    # deep: Annotated[
+    #     bool,
+    #     Field(
+    #         description=(
+    #             "Quick searches instantly. Deep is an agent — traverses, "
+    #             "reasons, expands. Prompt it like briefing a researcher; "
+    #             "detail drives quality."
+    #         )
+    #     ),
+    # ] = False,
 ) -> str:
     """How you think back — use it freely, for anything. What's \
 found gets read and your question gets answered, so what you \
@@ -628,6 +628,7 @@ ask shapes what comes back. Mentioning when something happened \
 sharpens results. Quick by default — deep when you need to \
 trace threads across many memories."""
     # ENV override: quick or deep forces the mode regardless of parameter
+    deep = False  # temporarily hardcoded
     use_deep = deep
     if RECALL_MODE == "quick":
         use_deep = False
