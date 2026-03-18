@@ -512,7 +512,7 @@ async def _do_quick_recall(query: str) -> str:
     """Quick mode: single recall + LLM synthesis."""
     body = {
         "query": query,
-        "max_tokens": 8192,
+        "max_tokens": 32000,
         "budget": "high",
         "types": ["world", "experience", "observation"],
         "include": {"chunks": {}},
